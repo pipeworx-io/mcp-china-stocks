@@ -32,6 +32,10 @@ interface McpToolExport {
 
 const ZT_POOL = 'https://push2ex.eastmoney.com/getTopicZTPool';
 const SINA = 'https://hq.sinajs.cn';
+// Eastmoney datacenter report API (业绩预告 / 盈利预测) — verified CF-egress-OK
+// 2026-07-17; note this is a DIFFERENT host from push2.eastmoney (which is
+// empty from any IP — see project memory) so don't lump them together.
+const DATACENTER = 'https://datacenter-web.eastmoney.com/api/data/v1/get';
 
 // ── helpers ──────────────────────────────────────────────────────────
 function num(v: unknown): number | null {
@@ -93,6 +97,31 @@ const tools: McpToolExport['tools'] = [
         symbols: { type: 'string', description: 'One 6-digit code or a comma-separated list, e.g. "600519" or "600519,000001,300750". sh/sz/bj prefixes are accepted but optional.' },
       },
       required: ['symbols'],
+    },
+  },
+  {
+    name: 'ashares_earnings_forecast',
+    description:
+      "Company-issued earnings guidance (业绩预告) for a Chinese A-share stock — the company's own forecast announcements with predicted profit range (lower/upper bounds in CNY), year-over-year change %, forecast type (略增/预增/扭亏 etc.), and the company's stated reason. Answers '业绩预测', '业绩预告', 'earnings forecast/guidance for a China A-share company like 华工科技 000988'. Most recent reports first. Source: Eastmoney datacenter (keyless).",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        symbol: { type: 'string', description: '6-digit A-share code, e.g. "000988" (华工科技) or "600519" (贵州茅台).' },
+        limit: { type: 'number', description: 'How many forecast announcements to return, 1–20 (default 4, newest first).' },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'ashares_analyst_consensus',
+    description:
+      'Analyst consensus estimates (盈利预测) for a Chinese A-share stock — per forecast year: consensus EPS, P/E at current price, net profit attributable to parent (归母净利润), and total operating revenue, in CNY. Answers "analyst estimates / 盈利预测 / forecast EPS for a China A-share like 000988". Source: Eastmoney datacenter (keyless).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        symbol: { type: 'string', description: '6-digit A-share code, e.g. "000988" or "300750" (宁德时代).' },
+      },
+      required: ['symbol'],
     },
   },
 ];
@@ -180,12 +209,100 @@ async function quote(args: Record<string, unknown>) {
   return { count: quotes.length, quotes };
 }
 
+function requireCode(args: Record<string, unknown>): string {
+  const code = String(args.symbol ?? args.code ?? args.symbols ?? '').replace(/\D/g, '');
+  if (!/^\d{6}$/.test(code)) {
+    throw new Error('symbol must be a 6-digit A-share code, e.g. "000988" or "600519".');
+  }
+  return code;
+}
+
+async function datacenter(reportName: string, code: string, extra: Record<string, string>) {
+  const params = new URLSearchParams({
+    reportName,
+    columns: 'ALL',
+    filter: `(SECURITY_CODE="${code}")`,
+    ...extra,
+  });
+  const res = await fetch(`${DATACENTER}?${params}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://data.eastmoney.com/' },
+  });
+  if (!res.ok) throw new Error(`Eastmoney datacenter ${res.status}`);
+  const body = (await res.json()) as {
+    success?: boolean;
+    result?: { data?: Array<Record<string, unknown>>; count?: number } | null;
+  };
+  // Unknown codes come back success:false / result:null, not an HTTP error.
+  return body.result?.data ?? [];
+}
+
+async function earningsForecast(args: Record<string, unknown>) {
+  const code = requireCode(args);
+  const want = Math.min(Math.max(Number(args.limit ?? 4), 1), 20);
+  const rows = await datacenter('RPT_PUBLIC_OP_NEWPREDICT', code, {
+    sortColumns: 'REPORT_DATE',
+    sortTypes: '-1',
+    pageSize: String(want),
+    pageNumber: '1',
+  });
+  if (rows.length === 0) {
+    return { symbol: code, found: false, message: `No company earnings guidance (业绩预告) on record for ${code} — check the code, or the company may not have issued guidance.` };
+  }
+  return {
+    symbol: code,
+    name: rows[0].SECURITY_NAME_ABBR ?? null,
+    count: rows.length,
+    note: 'Company-issued guidance (业绩预告), newest first. Amounts in CNY. predict_type is the company wording (预增=large increase, 略增=slight increase, 扭亏=turnaround, 预减=decrease).',
+    forecasts: rows.map((r) => ({
+      report_period: String(r.REPORT_DATE ?? '').slice(0, 10),
+      announced: String(r.NOTICE_DATE ?? '').slice(0, 10),
+      metric: r.PREDICT_FINANCE ?? null,
+      predict_type: r.PREDICT_TYPE ?? null,
+      forecast_state: r.FORECAST_STATE ?? null,
+      amount_lower_cny: num(r.PREDICT_AMT_LOWER),
+      amount_upper_cny: num(r.PREDICT_AMT_UPPER),
+      yoy_change_lower_pct: num(r.ADD_AMP_LOWER),
+      yoy_change_upper_pct: num(r.ADD_AMP_UPPER),
+      prior_year_same_period_cny: num(r.PREYEAR_SAME_PERIOD),
+      summary: r.PREDICT_CONTENT ?? null,
+      company_reason: r.CHANGE_REASON_EXPLAIN ?? null,
+      is_latest: r.IS_LATEST === 'T',
+    })),
+  };
+}
+
+async function analystConsensus(args: Record<string, unknown>) {
+  const code = requireCode(args);
+  const rows = await datacenter('RPT_RES_PROFITPREDICT', code, { pageSize: '10', pageNumber: '1' });
+  if (rows.length === 0) {
+    return { symbol: code, found: false, message: `No analyst consensus (盈利预测) on record for ${code} — small caps often have no analyst coverage.` };
+  }
+  return {
+    symbol: code,
+    name: rows[0].SECURITY_NAME_ABBR ?? null,
+    note: 'Analyst consensus (盈利预测) per forecast year. Amounts in CNY; PE is at the current price.',
+    estimates: rows
+      .map((r) => ({
+        year: num(r.PREDICT_YEAR),
+        eps_cny: num(r.EPS),
+        pe: num(r.PE) != null ? Math.round((num(r.PE) as number) * 100) / 100 : null,
+        net_profit_cny: num(r.PARENT_NETPROFIT),
+        revenue_cny: num(r.TOTAL_OPERATE_INCOME),
+      }))
+      .sort((a, b) => (a.year ?? 0) - (b.year ?? 0)),
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'ashares_limit_up':
       return limitUp(args);
     case 'ashares_quote':
       return quote(args);
+    case 'ashares_earnings_forecast':
+      return earningsForecast(args);
+    case 'ashares_analyst_consensus':
+      return analystConsensus(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
