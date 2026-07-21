@@ -73,6 +73,15 @@ function sinaSym(code: string): string {
   return `sh${n}`;
 }
 
+// The five headline A-share indices, Sina symbol → English name.
+const MARKET_INDICES: Array<{ sym: string; name: string; cn: string }> = [
+  { sym: 'sh000001', name: 'Shanghai Composite', cn: '上证指数' },
+  { sym: 'sz399001', name: 'Shenzhen Component', cn: '深证成指' },
+  { sym: 'sz399006', name: 'ChiNext', cn: '创业板指' },
+  { sym: 'sh000688', name: 'STAR 50', cn: '科创50' },
+  { sym: 'sh000300', name: 'CSI 300', cn: '沪深300' },
+];
+
 // ── tools ────────────────────────────────────────────────────────────
 const tools: McpToolExport['tools'] = [
   {
@@ -85,6 +94,15 @@ const tools: McpToolExport['tools'] = [
         date: { type: 'string', description: 'Trading day as YYYYMMDD or YYYY-MM-DD (default: most recent trading day).' },
         limit: { type: 'number', description: 'How many stocks to return, 1–100 (default 30). The total count is always returned regardless.' },
       },
+    },
+  },
+  {
+    name: 'ashares_market_snapshot',
+    description:
+      "Overall snapshot of the Chinese A-share market — the headline index levels (Shanghai Composite, Shenzhen Component, ChiNext, STAR 50, CSI 300) with change %, day range and turnover, plus how many stocks hit limit-up (涨停) today as a sentiment gauge. Answers 'how is the China A-share market doing', 'Shanghai Composite today', 'A-share market snapshot at close', 'how did Chinese stocks close'. Source: Sina + Eastmoney (keyless).",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
     },
   },
   {
@@ -165,6 +183,59 @@ async function limitUp(args: Record<string, unknown>) {
     returned: pool.length,
     note: 'Daily price limit is +10% for main-board A-shares, +20% for STAR (688xxx) and ChiNext (30xxxx). consecutive_boards>1 = a multi-day 连板 streak.',
     stocks: pool,
+  };
+}
+
+async function marketSnapshot() {
+  // Indices parse with the same Sina field layout as stock quotes.
+  const list = MARKET_INDICES.map((i) => i.sym).join(',');
+  const indices: Array<Record<string, unknown>> = [];
+  let asOf: string | null = null;
+  try {
+    const res = await fetch(`${SINA}/list=${list}`, { headers: { Referer: 'https://finance.sina.com.cn/', 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+    if (res.ok) {
+      const text = new TextDecoder('gbk').decode(await res.arrayBuffer());
+      const bySym = new Map<string, string[]>();
+      for (const line of text.split('\n')) {
+        const m = line.match(/hq_str_([a-z]{2}\d{6})="([^"]*)"/);
+        if (m && m[2]) bySym.set(m[1], m[2].split(','));
+      }
+      for (const idx of MARKET_INDICES) {
+        const f = bySym.get(idx.sym);
+        if (!f || f.length < 10) { indices.push({ index: idx.name, cn_name: idx.cn, found: false }); continue; }
+        const cur = Number(f[3]); const prev = Number(f[2]);
+        if (!asOf && f[30] && f[31]) asOf = `${f[30]} ${f[31]}`;
+        indices.push({
+          index: idx.name,
+          cn_name: idx.cn,
+          level: Number.isFinite(cur) ? Math.round(cur * 100) / 100 : null,
+          change: Number.isFinite(cur) && Number.isFinite(prev) ? Math.round((cur - prev) * 100) / 100 : null,
+          change_pct: Number.isFinite(cur) && Number.isFinite(prev) && prev !== 0 ? Math.round(((cur - prev) / prev) * 1e4) / 100 : null,
+          open: num(f[1]), high: num(f[4]), low: num(f[5]),
+          turnover_yuan: num(f[9]),
+        });
+      }
+    }
+  } catch { /* indices best-effort */ }
+
+  // Limit-up count (涨停家数) — a headline breadth/sentiment gauge for A-shares.
+  let limitUpCount: number | null = null;
+  const date = latestTradingDate();
+  try {
+    const params = new URLSearchParams({ ut: '7eea3edcaed734bea9cbfc24409ed989', dpt: 'wz.ztzt', Pageindex: '0', pagesize: '1', sort: 'fbt:asc', date });
+    const res = await fetch(`${ZT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
+    if (res.ok) {
+      const body = (await res.json()) as { data?: { tc?: number } | null };
+      limitUpCount = body.data?.tc ?? null;
+    }
+  } catch { /* breadth best-effort */ }
+
+  return {
+    market: 'China A-shares (Shanghai / Shenzhen / STAR / ChiNext)',
+    as_of: asOf ?? date,
+    indices,
+    limit_up_count: limitUpCount,
+    note: 'Index turnover is in CNY. limit_up_count = number of A-shares that closed at their daily price limit (+10%, or +20% for STAR/ChiNext) — a market-sentiment gauge. Use ashares_limit_up for the ranked limit-up pool. Source: Sina (indices) + Eastmoney (limit-up), keyless.',
   };
 }
 
@@ -295,6 +366,8 @@ async function analystConsensus(args: Record<string, unknown>) {
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
+    case 'ashares_market_snapshot':
+      return marketSnapshot();
     case 'ashares_limit_up':
       return limitUp(args);
     case 'ashares_quote':

@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/china-stocks",
   "title": "China Stocks",
   "description": "China A-shares MCP. Keyless.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "websiteUrl": "https://pipeworx.io/packs/china-stocks",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-china-stocks",

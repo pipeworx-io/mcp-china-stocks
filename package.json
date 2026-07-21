@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-china-stocks",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "China A-shares MCP. Keyless.",
   "type": "module",
   "main": "src/index.ts",
