@@ -1296,6 +1296,16 @@ async function dailyHistory(args: Record<string, unknown>) {
     // from the codes THIS call actually resolved (`found`), not the raw
     // request, so a partly-invalid `codes` list doesn't hand back a symbol
     // ashares_quote would reject.
+    //
+    // 14d re-measure (fleet #2325, 2026-10-07, same methodology as above —
+    // re-deriving the #2324 baseline at the same tool gave 29, not the 19
+    // quoted here; use this comment's own re-derived 29 as the apples-to-
+    // apples baseline, not the original 19): single-tool-only callers 29 ->
+    // 19 (total callers 194 -> 306, UP 58% — traffic grew while the
+    // single-tool share shrank), share 14.9% -> 6.2%, DOWN 8.7pt. The
+    // combination of more callers AND a lower single-tool share is the
+    // cleanest positive read of the 6 shipped hints. Full comparison in the
+    // fleet #2325 close.
     ...(found.length > 0
       ? {
           next: {
