@@ -710,6 +710,20 @@ const HQ_NODE_DATA = 'https://vip.stock.finance.sina.com.cn/quotes_service/api/j
 // 2026-07-17; note this is a DIFFERENT host from push2.eastmoney (which is
 // empty from any IP — see project memory) so don't lump them together.
 const DATACENTER = 'https://datacenter-web.eastmoney.com/api/data/v1/get';
+// Sina's minute-bar kline endpoint (分钟K线, keyless) — scale is the bar
+// interval in minutes (1/5/15/30/60); datalen caps out at ~1950 bars total
+// REGARDLESS of interval (verified live 2026-10-06: datalen=1950 works,
+// datalen=2000 returns the literal string "null"), so the retention window
+// shrinks as the interval shrinks: ~8 trading days at 1-minute, ~40 at
+// 5-minute, ~110 at 15-minute, ~1yr at 30-minute, ~2yr at 60-minute, and it
+// slides forward as new days trade and old ones drop off the back. Volume is
+// already in SHARES per bar (not the 100-share 手 lots gtimg's daily bars
+// use) and amount is CNY — cross-checked by summing a full day's 5-minute
+// bars against ashares_daily_history's daily volume for the same code+day
+// (515050 and 600519, 2026-09-01): both matched within ~0.1%, the residual
+// being end-of-day call-auction handling this endpoint attributes to the
+// last bar slightly differently than the daily close print.
+const SINA_KLINE = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData';
 
 // ── helpers ──────────────────────────────────────────────────────────
 function num(v: unknown): number | null {
@@ -862,6 +876,22 @@ const tools: McpToolExport['tools'] = [
         adjust: { type: 'string', enum: ['qfq', 'hfq', 'none'], description: 'Price adjustment for splits/dividends: qfq = forward-adjusted (default, prices comparable to today), hfq = backward-adjusted, none = raw unadjusted prices.' },
       },
       required: ['codes', 'start'],
+    },
+  },
+  {
+    name: 'ashares_intraday_bars',
+    description:
+      "Intraday minute bars (分钟线/分时/分钟K线) for Chinese A-share stocks/ETFs on a given trading日/交易日, with cumulative volume and turnover (累计成交量/累计成交额) computed up to a requested time of day (截至<time>, e.g. 截至11:05) — answers '515050在2026-09-01这个交易日截至11:05的累计成交量和累计成交额', '600519某个交易日截至某时刻的累计成交量和成交额', 'cumulative volume for 600519 up to 11:05 on a past trading day', 'intraday minute bars for an A-share on a specific date'. ashares_quote is realtime-only (today, right now) and ashares_daily_history is end-of-day-only (no intraday granularity) — this tool is for a PAST trading日's intraday trajectory. Returns the interval bars for that day plus cumulative_volume_shares/cumulative_turnover_cny summed from the day's open through `up_to` (or the whole day if `up_to` is omitted). `symbols` takes a bare 6-digit code (e.g. \"515050\") or the sh/sz/bj-prefixed form, same as ashares_quote. Bounded lookback: the upstream caps total bars at ~1950 regardless of interval, so retention shrinks as the interval shrinks — roughly 8 trading days at 1-minute, 40 at 5-minute (the default), 110 at 15-minute, a year at 30-minute, two years at 60-minute — and it slides forward daily. A `date` older than a result's `earliest_bar_date_available` is out of range for that interval; try a coarser interval, or use ashares_daily_history for daily (not intraday) history further back. Source: Sina (keyless).",
+    summary: "A China A-share stock's intraday minute bars and cumulative volume/turnover up to a given time on a past trading day, from Sina.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        symbols: { type: 'string', description: 'One 6-digit code or a comma-separated list, up to 5, e.g. "515050" or "600519,000001". sh/sz/bj prefixes accepted but optional. ETF codes work the same as stock codes.' },
+        date: { type: 'string', description: 'The trading day the bars are for, YYYY-MM-DD or YYYYMMDD, e.g. "2026-09-01".' },
+        up_to: { type: 'string', description: 'Time of day (24-hour, Beijing time) to cumulate volume/turnover through, e.g. "11:05". Omit for the whole trading day (or "as of now" if `date` is today and the market is open).' },
+        interval: { type: 'string', enum: ['1', '5', '15', '30', '60'], description: 'Bar interval in minutes. Default "5". Smaller intervals keep a shorter lookback window — see the tool description.' },
+      },
+      required: ['symbols', 'date'],
     },
   },
   {
@@ -1278,6 +1308,129 @@ async function dailyHistory(args: Record<string, unknown>) {
   };
 }
 
+// ── intraday minute bars ─────────────────────────────────────────────
+type SinaKlineRow = { day: string; open: string; high: string; low: string; close: string; volume: string; amount: string };
+
+/** HH:MM or HH:MM:SS -> "HH:MM:SS", or null if not parseable. */
+function normalizeTime(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const m = v.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (hh > 23 || mm > 59) return null;
+  return `${String(hh).padStart(2, '0')}:${m[2]}:${m[3] ?? '00'}`;
+}
+
+async function fetchSinaKline(sym: string, intervalMin: string): Promise<SinaKlineRow[] | null> {
+  const url = `${SINA_KLINE}?symbol=${sym}&scale=${intervalMin}&ma=no&datalen=1950`;
+  const res = await pwFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://finance.sina.com.cn/' } });
+  if (!res.ok) throw await httpError(res, 'Sina');
+  const text = await res.text();
+  const m = text.match(/var _=\((\[.*\]|null)\);/s);
+  if (!m) return null;
+  const parsed = JSON.parse(m[1]);
+  return Array.isArray(parsed) ? (parsed as SinaKlineRow[]) : null;
+}
+
+async function intradayBarsOne(code: string, date: string, upTo: string | null, intervalMin: string): Promise<Record<string, unknown>> {
+  const sym = sinaSym(code);
+  let all: SinaKlineRow[] | null;
+  try {
+    all = await fetchSinaKline(sym, intervalMin);
+  } catch (err) {
+    return { code, symbol: sym, found: false, message: `Fetch failed for ${sym}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (!all || all.length === 0) {
+    return { code, symbol: sym, found: false, message: `No intraday bar data for ${sym} — check the code.` };
+  }
+  const earliestBarDate = all[0].day.slice(0, 10);
+  const latestBarDate = all[all.length - 1].day.slice(0, 10);
+  const dayBars = all.filter((r) => r.day.startsWith(date));
+  if (dayBars.length === 0) {
+    const beforeWindow = date < earliestBarDate;
+    return {
+      code,
+      symbol: sym,
+      found: false,
+      earliest_bar_date_available: earliestBarDate,
+      latest_bar_date_available: latestBarDate,
+      message: beforeWindow
+        ? `No ${intervalMin}-minute bars for ${sym} on ${date} -- that date is before this symbol's current intraday retention window, which starts at ${earliestBarDate} for a ${intervalMin}-minute interval. Try a coarser interval (fewer, longer bars reach further back) or ashares_daily_history for daily (not intraday) history further back.`
+        : `No ${intervalMin}-minute bars for ${sym} on ${date} (not a trading day / market holiday, or the date is after the latest available bar at ${latestBarDate}).`,
+    };
+  }
+  const bars = dayBars.map((r) => ({
+    time: r.day.slice(11, 16),
+    open: num(r.open),
+    high: num(r.high),
+    low: num(r.low),
+    close: num(r.close),
+    volume_shares: num(r.volume) != null ? Math.round(num(r.volume) as number) : null,
+    turnover_cny: num(r.amount) != null ? Math.round(num(r.amount) as number) : null,
+  }));
+  const cutoff = upTo ? dayBars.filter((r) => r.day <= `${date} ${upTo}`) : dayBars;
+  const sum = (rows: SinaKlineRow[], key: 'volume' | 'amount') => rows.reduce((s, r) => s + (num(r[key]) ?? 0), 0);
+  const lastCutoffBar = cutoff[cutoff.length - 1] ?? null;
+  return {
+    code,
+    symbol: sym,
+    found: true,
+    exchange: exchangeOf(sym),
+    security_type: securityTypeOf(code),
+    date,
+    interval_minutes: Number(intervalMin),
+    as_of_time: lastCutoffBar ? lastCutoffBar.day.slice(11, 16) : null,
+    bars_through_as_of: cutoff.length,
+    cumulative_volume_shares: Math.round(sum(cutoff, 'volume')),
+    cumulative_turnover_cny: Math.round(sum(cutoff, 'amount')),
+    full_day_volume_shares: Math.round(sum(dayBars, 'volume')),
+    full_day_turnover_cny: Math.round(sum(dayBars, 'amount')),
+    returned_bars: bars.length,
+    bars,
+    earliest_bar_date_available: earliestBarDate,
+    latest_bar_date_available: latestBarDate,
+  };
+}
+
+async function intradayBars(args: Record<string, unknown>) {
+  const raw = String(args.symbols ?? '').trim();
+  if (!raw) throw new Error('symbols is required, e.g. "515050" or "600519,000001".');
+  const codes = raw.split(/[,\s]+/).filter(Boolean).slice(0, 5);
+  if (typeof args.date !== 'string' || !args.date.trim()) {
+    throw new Error('date is required, e.g. "2026-09-01" or "20260901" -- the trading day the bars are for.');
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const date = isoDate(args.date, today);
+  const intervalArg = args.interval != null ? String(args.interval).trim() : '5';
+  const interval = (['1', '5', '15', '30', '60'] as const).includes(intervalArg as '1' | '5' | '15' | '30' | '60') ? intervalArg : '5';
+  let upTo: string | null = null;
+  if (args.up_to != null) {
+    upTo = normalizeTime(args.up_to);
+    if (!upTo) throw new Error('up_to must be "HH:MM" (24-hour, Beijing time), e.g. "11:05".');
+  }
+
+  const results = await Promise.all(codes.map((c) => intradayBarsOne(c, date, upTo, interval)));
+  const found = results.filter((r) => r.found === true) as Array<{ code: string; exchange: string; security_type: string | null; cumulative_volume_shares: number; cumulative_turnover_cny: number; as_of_time: string | null }>;
+  const described = found.map((r) => `${r.code} (${r.security_type ?? 'security'} on the ${r.exchange})`).join(', ');
+  const upToLabel = upTo ? upTo.slice(0, 5) : 'end of day';
+  const statement =
+    `China A-share market (Chinese A-shares): ${interval}-minute intraday bars for ${described || codes.join(', ')} on ${date}, cumulative volume and turnover through ${upToLabel}. ` +
+    found.map((r) => `${r.code}: ${r.cumulative_volume_shares.toLocaleString()} shares / ¥${r.cumulative_turnover_cny.toLocaleString()} as of ${r.as_of_time ?? 'n/a'}.`).join(' ');
+  return {
+    country: 'China',
+    market: 'China A-share market (Shanghai, Shenzhen and Beijing exchanges)',
+    statement,
+    date,
+    up_to: upTo ? upTo.slice(0, 5) : null,
+    interval_minutes: Number(interval),
+    note:
+      'cumulative_volume_shares/cumulative_turnover_cny are summed by this pack from the interval bars between the start of the trading day and `up_to` inclusive (or the whole day if up_to is omitted). Lookback is bounded by the upstream (Sina), which returns at most ~1950 of the most-recent bars regardless of interval -- so the retention window is a sliding ~8 trading days at 1-minute, ~40 at 5-minute (default), ~110 at 15-minute, ~1 year at 30-minute, ~2 years at 60-minute, shrinking and sliding forward daily. A date older than earliest_bar_date_available in a result is out of range at that interval. Cross-checked against ashares_daily_history\'s daily volume for the same code+day: full-day sums here matched within ~0.1%.',
+    source: 'Sina quotes.sina.cn CN_MarketDataService.getKLineData (keyless)',
+    results,
+  };
+}
+
 // ── technical indicators ────────────────────────────────────────────
 // All computed client-side from ashares_daily_history's own OHLCV bars — no
 // new upstream call, no new vendor, no new key.
@@ -1481,6 +1634,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return analystConsensus(args);
     case 'ashares_daily_history':
       return dailyHistory(args);
+    case 'ashares_intraday_bars':
+      return intradayBars(args);
     case 'ashares_technical_indicators':
       return technicalIndicators(args);
     default:

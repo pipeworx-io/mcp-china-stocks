@@ -1,8 +1,8 @@
 # @pipeworx/china-stocks
 
-Live data for the Chinese A-share market (Shanghai / Shenzhen / STAR / ChiNext) — real-time quotes, daily OHLCV history, the limit-up board, market-wide turnover ranking, and company earnings guidance/analyst consensus.
+Live data for the Chinese A-share market (Shanghai / Shenzhen / STAR / ChiNext) — real-time quotes, intraday minute bars, daily OHLCV history, technical indicators, the limit-up board, market-wide turnover ranking, and company earnings guidance/analyst consensus.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1704+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -10,6 +10,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `ashares_limit_up({ date?, limit? })` — the daily limit-up board (涨停板): how many stocks hit their daily price limit and the ranked pool with consecutive-board count, seal fund, industry, turnover.
 - `ashares_quote({ symbols })` — real-time quote(s) by 6-digit code, comma-separated.
 - `ashares_daily_history({ codes, start, end?, adjust? })` — daily OHLCV history (open/high/low/close/volume, day-over-day change %) for up to 20 codes over a date range. `adjust`: `qfq` (forward-adjusted, default), `hfq` (backward-adjusted), or `none` (raw). Turnover amount (成交额) is not exposed by the daily-bar source, so `amount_cny` reports `"not_available"` per row rather than being estimated — use `ashares_quote` or `ashares_turnover_ranking` for same-day turnover amount.
+- `ashares_intraday_bars({ symbols, date, up_to?, interval? })` — intraday minute bars (分时/分钟K线) for a past trading day, up to 5 comma-separated codes, with `cumulative_volume_shares`/`cumulative_turnover_cny` summed from the day's open through `up_to` (e.g. `"11:05"`; omit for the whole day). `interval` is the bar size in minutes (`1`/`5`/`15`/`30`/`60`, default `5`). **Bounded lookback**: the upstream caps total bars at ~1950 regardless of interval, so retention shrinks with interval and slides forward daily — roughly 8 trading days at 1-minute, 40 at 5-minute (default), 110 at 15-minute, a year at 30-minute, two years at 60-minute. A result's `earliest_bar_date_available`/`latest_bar_date_available` state the live bound for that call; a `date` older than `earliest_bar_date_available` needs a coarser `interval` or `ashares_daily_history` (daily only, no intraday).
 - `ashares_turnover_ranking({ limit?, sort?, order?, board? })` — market-wide ranking by turnover amount, change %, or volume, server-side sorted, with turnover in CNY.
 - `ashares_earnings_forecast({ symbol, limit? })` — company-issued earnings guidance (业绩预告): predicted profit range, YoY change %, forecast type, stated reason.
 - `ashares_analyst_consensus({ symbol })` — analyst consensus estimates (盈利预测) per forecast year: EPS, PE, net profit, revenue.
@@ -27,6 +28,8 @@ Keyless. All upstreams are public, unauthenticated endpoints.
 - `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get` — Tencent/gtimg daily K-line bars. `param=<sym>,day,<start>,<end>,<count>,<adjust>` where `<sym>` is `sh`/`sz`/`bj` + 6-digit code and `<adjust>` is `qfq`/`hfq`/empty (unadjusted, still needs the trailing comma or the request 400s). Response key is `qfqday`/`hfqday`/`day` matching the adjust arg; an invalid code returns HTTP 200 with an empty `day` array rather than an error, so treat empty rows as `found: false`, not a fetch failure. Rows are `[date, open, close, high, low, volume]` — note the volume unit is 手 (lots of 100 shares), not raw shares, and there is no turnover-amount field in any adjust variant. A single request only accepts one `param=` (repeating the query param keeps only the last), so multi-code history is N parallel requests, not a batch call.
 
 Turnover amount is deliberately absent from `ashares_daily_history`: checked both the gtimg row form (all three adjust variants) and Sina's `hisdata/klc_kl.js` second-leg endpoint (binary-encoded, not a usable JSON leg) — neither exposes daily amount, so it is reported as `not_available` rather than derived from price × volume.
+
+- `https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData` — Sina's minute-bar kline (分钟K线), keyless. `?symbol=<sh|sz|bj><code>&scale=<1|5|15|30|60>&ma=no&datalen=1950`; `datalen` caps at ~1950 total bars regardless of `scale` (verified 2026-10-06: 1950 works, 2000 returns the literal string `null`), so retention shrinks as `scale` shrinks — the live window is reported per-call as `earliest_bar_date_available`/`latest_bar_date_available`. Response is JSONP-shaped text (`var _=([...]);`) rather than plain JSON, so it needs a regex extract, not `res.json()`. Each row's `volume` is already in **shares** (not the 100-share 手 lots `ashares_daily_history`'s gtimg source uses) and `amount` is CNY turnover — summing a full day's 5-minute bars for 515050 and 600519 on 2026-09-01 matched `ashares_daily_history`'s daily volume for the same code+day within ~0.1% (the residual is end-of-day call-auction handling). `ashares_intraday_bars` sums these bars client-side into `cumulative_volume_shares`/`cumulative_turnover_cny`.
 
 ## Quick Start
 
@@ -72,7 +75,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1704+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
