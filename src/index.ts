@@ -679,6 +679,15 @@ function collapse(s: string): string {
  *    industry, turnover. Source: Eastmoney push2ex (JSON, keyless).
  *  - Real-time A-share QUOTES by symbol. Source: Sina hq.sinajs.cn (keyless; names
  *    are GBK-encoded, decoded via TextDecoder).
+ *  - LIMIT-DOWN board (跌停板) — the counterpart to limit-up. Source: Eastmoney
+ *    push2ex getTopicDTPool (keyless). Added 2026-10-08 (fleet #2831); earlier
+ *    project memory recorded this endpoint as gated (rc:206) — re-verified
+ *    live and working, so that note no longer applies.
+ *  - MARGIN FINANCING / securities-lending balance (融资融券余额), market-wide
+ *    by exchange + per-SZSE-stock. Source: SSE query.sse.com.cn/marketdata/
+ *    tradedata/queryMargin.do + SZSE www.szse.cn ShowReport CATALOGID=1837_xxpl
+ *    (both keyless). Added 2026-10-08 (fleet #2831) — the #1 demand-read gap
+ *    (42 distinct callers, 14d) at the time this was built.
  *
  * Note: both upstreams are China-hosted; verified reachable, but see egress notes.
  */
@@ -693,7 +702,41 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 }
 
 const ZT_POOL = 'https://push2ex.eastmoney.com/getTopicZTPool';
+// Limit-DOWN pool (跌停板), same host/auth-token shape as ZT_POOL above.
+// NOTE: project memory from 2026-09-07 recorded this as "rc:206 data:null —
+// endpoint gated/changed". Re-verified live from a throwaway CF Worker under
+// the pipeworx prod account on 2026-10-08 (fleet #2831): rc:0, 9 real
+// limit-down stocks returned for 2026-10-08. Whatever gated it before is no
+// longer gating it — do not treat this comment as a reason to avoid it again
+// without re-checking.
+const DT_POOL = 'https://push2ex.eastmoney.com/getTopicDTPool';
 const SINA = 'https://hq.sinajs.cn';
+// SSE's own daily margin-trading summary (融资融券交易汇总), market-wide —
+// NOT the generic commonQuery.do (that fails open: an unknown sqlId returns
+// HTTP 200 with data:null, which looks exactly like "no data today" unless
+// you already know the real path). Returns the most recent N published days,
+// newest first, no date param needed/supported. Fields are already in CNY
+// (元) — the one exchange of the two that needs no unit conversion. Verified
+// live 2026-10-08 (fleet #2831) via a throwaway CF Worker: 200, real rows for
+// 2026-09-30 (the last trading day before the 10-01..10-08 National Day
+// closure).
+const SSE_MARGIN = 'https://query.sse.com.cn/marketdata/tradedata/queryMargin.do';
+// SZSE's margin-trading report via the same ShowReport mechanism as
+// ashares_sector_flows' sibling pack (china-exchange-data) — CATALOGID
+// 1837_xxpl, tab1 = market-wide total, tab2 = per-stock detail (filter with
+// txtZqdm, NOT the uppercase TXTZQDM the hidden-field metadata might suggest).
+// txtDate is YYYY-MM-DD (not YYYYMMDD) and REQUIRED — omit it and SZSE dumps
+// its entire history since 2010 instead of defaulting to latest. A date with
+// no published data (today, a weekend, a holiday) comes back with an empty
+// `data` array and a blank `metadata.subname` — a real 200, not an error, so
+// the caller must walk back trading days itself. tab1's `jrrjye` (融券余额)
+// is in 亿元 (×1e8); tab2's `jrrjye` is in **万元** (×1e4) — same field name,
+// different unit, confirmed by live probe 2026-10-08 (fleet #2831): this is
+// exactly the 100×-error trap a sibling project's china-market-data notes
+// warned about. Verified live via throwaway CF Worker: 200, real rows for
+// both tab1 (market total) and tab2 (000001 平安银行 detail).
+const SZSE_MARGIN = 'https://www.szse.cn/api/report/ShowReport/data';
+const SZSE_MARGIN_REFERER = 'https://www.szse.cn/market/trend/index.html';
 // Tencent/gtimg daily K-line (日K线) — forward/backward-adjusted or raw daily
 // OHLCV bars for a single code + date range. Keyless. Verified 2026-09-03
 // (fleet task #1208): row = [date, open, close, high, low, volume_lots].
@@ -710,6 +753,45 @@ const HQ_NODE_DATA = 'https://vip.stock.finance.sina.com.cn/quotes_service/api/j
 // 2026-07-17; note this is a DIFFERENT host from push2.eastmoney (which is
 // empty from any IP — see project memory) so don't lump them together.
 const DATACENTER = 'https://datacenter-web.eastmoney.com/api/data/v1/get';
+// Eastmoney per-stock capital-flow daily history (主力净流入/超大单/大单/中单/
+// 小单净流入), keyless. Added 2026-10-08 (fleet #2840). Re-probed live: this
+// is push2HIS (not push2), which is NOT the gated host — project memory's
+// "push2.eastmoney.com empty from any IP" does not apply here, confirmed by a
+// real 200 with real klines for 000768 (中航西飞) on first probe.
+const FFLOW_DAYKLINE = 'https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get';
+// Eastmoney 龙虎榜 (dragon-tiger list) daily detail — same datacenter-web host
+// as DATACENTER above, different reportName. Verified live 2026-10-08 for
+// 2026-09-24 (real rows, e.g. 平潭发展 000592 with buy/sell/net amounts).
+const BILLBOARD_REPORT = 'RPT_DAILYBILLBOARD_DETAILSNEW';
+// Market-wide institution-seat net-buy detail per stock for a date (one row
+// per stock that had an institutional seat trade that day) — NOT filterable
+// by SECURITY_CODE (that returns "返回数据为空", a real empty, not an error);
+// join client-side by SECURITY_CODE against BILLBOARD_REPORT's rows instead.
+// Report name recovered from data.eastmoney.com/stock/lhb.html's own embedded
+// API calls (jgmmqk widget), not guessed. Verified live 2026-10-08.
+const BILLBOARD_ORG_REPORT = 'RPT_ORGANIZATION_TRADE_DETAILSNEW';
+// That day's most-active brokerage branches market-wide (not per-stock) — the
+// closest keyless "top brokerages" signal for a 龙虎榜 date; also recovered
+// from lhb.html (hyyyb widget). Verified live 2026-10-08.
+const BILLBOARD_BRANCH_REPORT = 'RPT_OPERATEDEPT_ACTIVE';
+// Bulk per-day, per-stock valuation snapshot (ALL ~5,500+ A-shares in one
+// paged report) — the one genuinely historical bulk Eastmoney report found
+// for a PAST date: price, change %, market cap, and industry/板块
+// (BOARD_NAME), for any TRADE_DATE. It does NOT carry turnover amount or
+// volume (checked every column — see README), so it backs ashares_
+// turnover_ranking's `date` + `sort:'changepercent'` path and the industry
+// enrichment, but NOT a historical sort:'amount'/'volume' ranking. Verified
+// live 2026-10-08 for 2026-09-22 (real rows, including two real IPO-debut
+// ~700% first-day movers, sanity-checked as plausible rather than garbage).
+const VALUE_ANALYSIS_REPORT = 'RPT_VALUEANALYSIS_DET';
+// ETF fund-share-count disclosure history (期末总份额/期末净资产), keyless.
+// Added 2026-10-08 (fleet #2840). IMPORTANT, re-verified live for all 4
+// requested ETFs (515050/561980/588170/588200): this is NOT a daily series —
+// Chinese ETFs disclose 份额 at period boundaries (quarter-end) plus ad-hoc
+// material-change dates (e.g. 515050 also has an off-cycle 2026-05-12 row),
+// not every trading day. ashares_etf_shares reports exactly what's disclosed
+// and says so rather than fabricating daily rows between disclosures.
+const ETF_SHARES_ARCHIVE = 'https://fundf10.eastmoney.com/FundArchivesDatas.aspx';
 // Sina's minute-bar kline endpoint (分钟K线, keyless) — scale is the bar
 // interval in minutes (1/5/15/30/60); datalen caps out at ~1950 bars total
 // REGARDLESS of interval (verified live 2026-10-06: datalen=1950 works,
@@ -768,6 +850,26 @@ function sinaSym(code: string): string {
   if (/^(4|8)/.test(n)) return `bj${n}`; // Beijing exchange
   return `sh${n}`;
 }
+/** SZSE's ShowReport formats large numbers with thousands separators (e.g. "12,358.98"). */
+function cnNum(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  const n = Number(v.replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+/** YYYYMMDD -> YYYY-MM-DD. */
+function ymdToIso(v: unknown): string | null {
+  const s = String(v ?? '');
+  return /^\d{8}$/.test(s) ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : null;
+}
+function isoToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+function isoMinusDays(iso: string, days: number): string {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
 
 // The five headline A-share indices, Sina symbol → English name.
 const MARKET_INDICES: Array<{ sym: string; name: string; cn: string }> = [
@@ -794,9 +896,35 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'ashares_limit_down',
+    description:
+      "The Chinese A-share market's LIMIT-DOWN board (跌停板) for a trading day — how many stocks hit their daily DOWN price limit (-10%, or -20% for STAR/ChiNext) and the ranked list of those stocks. Answers 'how many A-shares hit limit down today', '跌停家数', 'which stocks 跌停', 'limit-down stock count for a China A-share trading day' — the counterpart to ashares_limit_up, together giving market-wide limit-up/limit-down breadth. Each stock includes code, name, price, change % (negative), turnover (成交额), float market cap, turnover rate (换手率), seal fund (封板资金), last seal time, industry (行业), and P/E. Source: Eastmoney (keyless).",
+    summary: 'China A-share stocks that hit their daily limit-down price today, from Eastmoney.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        date: { type: 'string', description: 'Trading day as YYYYMMDD or YYYY-MM-DD (default: most recent trading day).' },
+        limit: { type: 'number', description: 'How many stocks to return, 1–100 (default 30). The total count is always returned regardless.' },
+      },
+    },
+  },
+  {
+    name: 'ashares_margin_financing',
+    description:
+      "China A-share margin financing and securities lending balance (融资融券余额/两融余额) — the market-wide leverage gauge: aggregate financing balance (融资余额, money borrowed to buy stock), securities-lending balance (融券余额, shares borrowed to short), and their combined total (融资融券余额), for the Shanghai (SSE) and Shenzhen (SZSE) exchanges separately and combined, with day-over-day change. Answers '融资余额', '两融余额', '融资融券余额', 'margin financing balance', 'China A-share margin debt', 'how much margin debt is in the A-share market', 'margin balance day over day change'. Pass a 6-digit SZSE code (0/3/159-prefixed) in `symbol` for that stock's own 融资余额/融券余额/融资融券余额 instead of the market aggregate — SSE (6xxxxx) per-stock detail is not available via any verified keyless route, so a SH code returns a clear not_available message rather than silently substituting. Margin data publishes T+1 (today's figures appear tomorrow morning); a request for a day with nothing published yet or a non-trading day (weekend/holiday) automatically falls back to the last trading day that published, and says so. Amounts in CNY (converted from each exchange's native 元/亿元/万元 units and labelled). Source: SSE query.sse.com.cn (keyless) + SZSE www.szse.cn ShowReport CATALOGID=1837_xxpl (keyless).",
+    summary: "The China A-share market's aggregate margin financing and securities lending balance, from SSE + SZSE.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        symbol: { type: 'string', description: 'Optional 6-digit SZSE code (0/3/159-prefixed, e.g. "000001" 平安银行) for that stock\'s own margin balance instead of the market-wide aggregate. SSE codes (6xxxxx) are not supported here — no verified keyless per-stock route exists.' },
+        date: { type: 'string', description: 'Trading day as YYYY-MM-DD or YYYYMMDD (default: most recent day with published data). Margin data is T+1, so "today" usually has nothing yet.' },
+      },
+    },
+  },
+  {
     name: 'ashares_market_snapshot',
     description:
-      "Overall snapshot of the Chinese A-share market — the headline index levels (Shanghai Composite, Shenzhen Component, ChiNext, STAR 50, CSI 300) with change %, day range and turnover, plus how many stocks hit limit-up (涨停) today as a sentiment gauge. Answers 'how is the China A-share market doing', 'Shanghai Composite today', 'A-share market snapshot at close', 'how did Chinese stocks close'. Source: Sina + Eastmoney (keyless).",
+      "Overall snapshot of the Chinese A-share market — the headline index levels (Shanghai Composite, Shenzhen Component, ChiNext, STAR 50, CSI 300) with change %, day range and turnover, plus market-wide breadth as a sentiment gauge: how many stocks hit limit-up (涨停) and limit-down (跌停) today. Answers 'how is the China A-share market doing', 'Shanghai Composite today', 'A-share market snapshot at close', 'how did Chinese stocks close', '涨跌停家数', 'limit-up limit-down counts today'. For the ranked pools use ashares_limit_up / ashares_limit_down; for market-wide margin financing leverage use ashares_margin_financing. Source: Sina + Eastmoney (keyless).",
     summary: 'A snapshot of current China A-share market indices and breadth, from Eastmoney.',
     inputSchema: {
       type: 'object' as const,
@@ -819,20 +947,63 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'ashares_turnover_ranking',
     description:
-      "Market-wide ranking of Chinese A-share stocks by turnover / 成交额排名, 成交额前30名, 成交量排名, or 涨跌幅排名 — the whole board (not specific codes), sorted server-side and returned as a ranked list. Answers 'A股成交额前30名', 'top 30 A-shares by turnover today', 'A股成交量排名', 'A-share market-wide ranking by amount/volume/change %', 'which A-shares traded the most today'. Each row has code, name, price, change %, volume (shares), turnover in CNY (成交额), turnover rate %, and quote time. Source: Sina Market_Center.getHQNodeData (keyless).",
-    summary: 'China A-share stocks ranked by trading turnover today, from Eastmoney.',
+      "Market-wide ranking of Chinese A-share stocks by turnover / 成交额排名, 成交额前30名, 成交量排名, or 涨跌幅排名 — the whole board (not specific codes), sorted server-side and returned as a ranked list. Answers 'A股成交额前30名', 'top 30 A-shares by turnover today', 'A股成交量排名', 'A-share market-wide ranking by amount/volume/change %', 'which A-shares traded the most today'. Each row has code, name, price, change %, volume (shares), turnover in CNY (成交额), turnover rate %, and industry (行业/板块, when resolvable). Omit `date` (or pass today) for the LIVE board (Sina, real-time). Pass a PAST trading day in `date` for that day's ranking instead of today's — this uses a different, Eastmoney-sourced historical path and only supports `sort:'changepercent'` (涨跌幅排名): no keyless bulk source for a PAST day's turnover amount or volume ranking was found (Sina's live board is the only amount/volume source), so `date` + `sort:'amount'|'volume'` throws a clear error naming that gap rather than silently substituting today's board. A non-trading `date` (weekend/holiday) walks back to the prior trading day automatically.",
+    summary: 'China A-share stocks ranked by trading turnover today, or by change % on a past trading day, from Sina/Eastmoney.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         limit: { type: 'number', description: 'How many stocks to return, 1–100 (default 30).' },
-        sort: { type: 'string', enum: ['amount', 'changepercent', 'volume'], description: 'Rank by turnover amount (成交额, default), change % (涨跌幅), or share volume (成交量).' },
+        sort: { type: 'string', enum: ['amount', 'changepercent', 'volume'], description: "Rank by turnover amount (成交额, default), change % (涨跌幅), or share volume (成交量). For a PAST `date`, only 'changepercent' is available — 'amount'/'volume' throw a clear error for historical dates (no keyless historical source for those two)." },
         order: { type: 'string', enum: ['desc', 'asc'], description: 'desc (default, highest first) or asc.' },
         board: {
           type: 'string',
           enum: ['hs_a', 'sh_a', 'sz_a', 'cyb'],
           description: "Which board to rank: hs_a = all Shanghai+Shenzhen A-shares (default, 沪深A股), sh_a = Shanghai only (沪市A股), sz_a = Shenzhen only (深市A股), cyb = ChiNext (创业板).",
         },
+        date: { type: 'string', description: "A PAST trading day, YYYY-MM-DD or YYYYMMDD, for that day's ranking instead of today's live board. Only `sort:'changepercent'` is supported with a past date. Omit for the live board." },
       },
+    },
+  },
+  {
+    name: 'ashares_capital_flow',
+    description:
+      "Per-stock daily main-capital net inflow history (主力净流入 / 超大单+大单净流入, often called '超大单净流入' in retail trackers) for a Chinese A-share stock or ETF — one row per trading day with net inflow broken down by order size: 超大单 (super-large/institutional), 大单 (large), 中单 (medium), 小单 (small), plus 主力净流入 (main = 超大单+大单combined) in both CNY amount and as a % of that day's turnover. Answers '主力净流入历史', '超大单净流入', '000768最近20个交易日的主力资金流向', 'main capital net inflow history for a China A-share stock', 'which days did big money flow into/out of a stock'. A positive net inflow means net buying pressure from that order-size bucket that day, negative means net selling. Source: Eastmoney push2his fflow/daykline (keyless).",
+    summary: "A China A-share stock's daily main-capital (主力) net inflow history, from Eastmoney.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: '6-digit A-share or ETF code, e.g. "000768" (中航西飞) or "515050". sh/sz/bj prefixes accepted but optional.' },
+        days: { type: 'number', description: 'How many of the most recent trading days to return, 1–200 (default 20).' },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'ashares_billboard',
+    description:
+      "The Chinese A-share market's daily 龙虎榜 (dragon-tiger list / billboard) for a trading day — stocks flagged for unusual price/turnover deviation, with the top seats' buy/sell/net amounts, plus (when present that day) institution-seat (机构专用) net-buy detail and that day's most-active brokerage branches (营业部) market-wide as a 'top brokerages' signal. Answers '龙虎榜', 'dragon tiger list for a date', 'which stocks were on the billboard on 2026-09-24', '机构净买入', 'institution seat net buys', 'top active brokerage seats'. Each listed stock has the reason it was flagged (EXPLANATION, e.g. daily move ≥7%), close price, change %, and billboard buy/sell/net amounts in CNY; stocks that also had institutional-seat activity that day carry institution_net_buy_cny/institution_buy_seats/institution_sell_seats. A non-trading `date` (weekend/holiday) walks back to the prior trading day automatically. Source: Eastmoney datacenter-web (keyless).",
+    summary: "The China A-share market's daily dragon-tiger list (龙虎榜) with seat net-buy amounts, from Eastmoney.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        date: { type: 'string', description: 'Trading day as YYYY-MM-DD or YYYYMMDD (default: most recent trading day).' },
+        limit: { type: 'number', description: 'How many billboard-listed stocks to return, 1–100 (default 50).' },
+      },
+    },
+  },
+  {
+    name: 'ashares_etf_shares',
+    description:
+      "Disclosed fund-share-count (基金份额) and net-asset history for a Chinese-listed ETF — period-end total shares outstanding (期末总份额), the period's subscriptions/redemptions (期间申购/赎回), and period-end net assets (期末净资产), in shares and CNY. Answers '基金份额变动', 'ETF shares outstanding history', '515050规模变动', 'how many shares outstanding does this ETF have over time'. IMPORTANT: this is NOT a daily series — Chinese ETFs publicly disclose 份额 only at quarter-end plus occasional ad-hoc material-change dates (confirmed live for 515050/561980/588170/588200), not every trading day; a `from`/`to` window with no disclosure inside it returns found:false naming the nearest disclosed dates rather than fabricating daily rows. For a daily PRICE series use ashares_daily_history; this tool is share-count/AUM only. Source: Eastmoney fund F10 archive (keyless).",
+    summary: "A Chinese ETF's disclosed share-count and net-asset history (period-end, not daily), from Eastmoney.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: '6-digit ETF code, e.g. "515050", "561980", "588170", "588200", or "512000".' },
+        from: { type: 'string', description: 'Earliest disclosure date to include, YYYY-MM-DD or YYYYMMDD (inclusive). Default: no lower bound (full history, newest first, capped).' },
+        to: { type: 'string', description: 'Latest disclosure date to include, YYYY-MM-DD or YYYYMMDD (inclusive). Default: today (no upper bound in practice).' },
+      },
+      required: ['code'],
     },
   },
   {
@@ -968,6 +1139,45 @@ async function limitUp(args: Record<string, unknown>) {
   };
 }
 
+async function limitDown(args: Record<string, unknown>) {
+  const date = (typeof args.date === 'string' && args.date.trim() ? args.date.replace(/-/g, '') : latestTradingDate()).slice(0, 8);
+  const want = Math.min(Math.max(Number(args.limit ?? 30), 1), 100);
+  const params = new URLSearchParams({
+    ut: '7eea3edcaed734bea9cbfc24409ed989',
+    dpt: 'wz.ztzt',
+    Pageindex: '0',
+    pagesize: String(Math.max(want, 100)),
+    sort: 'fund:asc',
+    date,
+  });
+  const res = await pwFetch(`${DT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
+  if (!res.ok) throw await httpError(res, 'Eastmoney');
+  const body = (await res.json()) as { rc?: number; data?: { tc?: number; qdate?: number; pool?: Array<Record<string, unknown>> } | null };
+  if (!body.data || !Array.isArray(body.data.pool)) {
+    return { date, found: false, message: `No limit-down data for ${date} (not a trading day, or data not yet published).` };
+  }
+  const pool = body.data.pool.slice(0, want).map((s) => ({
+    code: s.c ?? null,
+    name: s.n ?? null,
+    price: price(s.p),
+    change_pct: num(s.zdp) != null ? Math.round((num(s.zdp) as number) * 100) / 100 : null,
+    turnover_yuan: num(s.amount),
+    float_mktcap_yuan: num(s.ltsz),
+    turnover_rate_pct: num(s.hs) != null ? Math.round((num(s.hs) as number) * 100) / 100 : null,
+    pe_ratio: num(s.pe),
+    seal_fund_yuan: num(s.fund),
+    last_seal_time: hms(s.lbt),
+    industry: s.hybk ?? null,
+  }));
+  return {
+    date: String(body.data.qdate ?? date),
+    limit_down_count: body.data.tc ?? pool.length,
+    returned: pool.length,
+    note: 'Daily price limit is -10% for main-board A-shares, -20% for STAR (688xxx) and ChiNext (30xxxx). Counterpart to ashares_limit_up.',
+    stocks: pool,
+  };
+}
+
 async function marketSnapshot() {
   // Indices parse with the same Sina field layout as stock quotes.
   const list = MARKET_INDICES.map((i) => i.sym).join(',');
@@ -1000,8 +1210,11 @@ async function marketSnapshot() {
     }
   } catch { /* indices best-effort */ }
 
-  // Limit-up count (涨停家数) — a headline breadth/sentiment gauge for A-shares.
+  // Limit-up / limit-down counts (涨跌停家数) — headline breadth/sentiment
+  // gauges for A-shares. Two independent best-effort calls so one failing
+  // doesn't blank out the other.
   let limitUpCount: number | null = null;
+  let limitDownCount: number | null = null;
   const date = latestTradingDate();
   try {
     const params = new URLSearchParams({ ut: '7eea3edcaed734bea9cbfc24409ed989', dpt: 'wz.ztzt', Pageindex: '0', pagesize: '1', sort: 'fbt:asc', date });
@@ -1011,14 +1224,101 @@ async function marketSnapshot() {
       limitUpCount = body.data?.tc ?? null;
     }
   } catch { /* breadth best-effort */ }
+  try {
+    const params = new URLSearchParams({ ut: '7eea3edcaed734bea9cbfc24409ed989', dpt: 'wz.ztzt', Pageindex: '0', pagesize: '1', sort: 'fund:asc', date });
+    const res = await pwFetch(`${DT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
+    if (res.ok) {
+      const body = (await res.json()) as { data?: { tc?: number } | null };
+      limitDownCount = body.data?.tc ?? null;
+    }
+  } catch { /* breadth best-effort */ }
 
   return {
     market: 'China A-shares (Shanghai / Shenzhen / STAR / ChiNext)',
     as_of: asOf ?? date,
     indices,
     limit_up_count: limitUpCount,
-    note: 'Index turnover is in CNY. limit_up_count = number of A-shares that closed at their daily price limit (+10%, or +20% for STAR/ChiNext) — a market-sentiment gauge. Use ashares_limit_up for the ranked limit-up pool. Source: Sina (indices) + Eastmoney (limit-up), keyless.',
+    limit_down_count: limitDownCount,
+    note: 'Index turnover is in CNY. limit_up_count/limit_down_count = number of A-shares that closed at their daily +10%/-10% price limit (+20%/-20% for STAR/ChiNext) — market-sentiment gauges. Use ashares_limit_up / ashares_limit_down for the ranked pools, and ashares_margin_financing for market-wide leverage (融资融券余额). Source: Sina (indices) + Eastmoney (limit counts), keyless.',
   };
+}
+
+// ── generic Eastmoney datacenter-web helper (RPT_* reports) ───────────
+// Shared by billboard/institution-seat/active-branch/value-analysis lookups
+// below -- all four live on the same host+shape as the existing earnings/
+// consensus DATACENTER calls, just with different reportName/filter/sort.
+async function dcQuery(params: Record<string, string>): Promise<Array<Record<string, unknown>>> {
+  const qs = new URLSearchParams({ columns: 'ALL', source: 'WEB', client: 'WEB', ...params });
+  const res = await pwFetch(`${DATACENTER}?${qs}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://data.eastmoney.com/' } });
+  if (!res.ok) throw await httpError(res, 'Eastmoney datacenter');
+  const body = (await res.json()) as { success?: boolean; code?: number; message?: string; result?: { data?: Array<Record<string, unknown>> } | null };
+  if (body.success === false) {
+    // code 9201 ("返回数据为空") is a real, legitimate empty result (e.g. a
+    // stock with no institutional-seat trade that day) -- NOT a transport or
+    // parse failure. Every other non-success code is treated as loud: throw,
+    // don't silently return [] and have it read as "no data" either.
+    if (body.code === 9201) return [];
+    throw new Error(`Eastmoney datacenter report error${body.code ? ` (${body.code})` : ''}: ${body.message ?? 'unknown error'} -- reportName=${params.reportName ?? '?'}`);
+  }
+  return body.result?.data ?? [];
+}
+
+/** Best-effort industry (行业/板块) lookup for a batch of codes, via the
+ * bulk VALUE_ANALYSIS_REPORT (sorted newest-TRADE_DATE-first so the first
+ * occurrence per code is its latest). Never throws -- an enrichment lookup
+ * failing should not break the ranking call it enriches. */
+async function industriesByCode(codes: string[]): Promise<Map<string, string>> {
+  const clean = codes.filter(Boolean);
+  if (clean.length === 0) return new Map();
+  const list = clean.map((c) => `"${c}"`).join(',');
+  try {
+    const rows = await dcQuery({
+      reportName: VALUE_ANALYSIS_REPORT,
+      columns: 'SECURITY_CODE,BOARD_NAME,TRADE_DATE',
+      filter: `(SECURITY_CODE in (${list}))`,
+      sortColumns: 'TRADE_DATE',
+      sortTypes: '-1',
+      pageSize: String(Math.min(Math.max(clean.length * 3, 30), 300)),
+      pageNumber: '1',
+    });
+    const map = new Map<string, string>();
+    for (const r of rows) {
+      const c = String(r.SECURITY_CODE ?? '');
+      const b = typeof r.BOARD_NAME === 'string' ? r.BOARD_NAME : null;
+      if (c && b && !map.has(c)) map.set(c, b);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/** Walk back from `dateIso` until VALUE_ANALYSIS_REPORT has rows for that
+ * date (covers weekends/holidays), ranked by change % -- the only field
+ * this bulk report shares with ashares_turnover_ranking's live sort options. */
+async function historicalChangeRanking(dateIso: string, ascFlag: '0' | '1', maxTries = 8): Promise<{ date: string; rows: Array<Record<string, unknown>> }> {
+  let cursor = dateIso;
+  for (let i = 0; i < maxTries; i++) {
+    const rows = await dcQuery({
+      reportName: VALUE_ANALYSIS_REPORT,
+      filter: `(TRADE_DATE='${cursor}')`,
+      sortColumns: 'CHANGE_RATE',
+      sortTypes: ascFlag === '1' ? '1' : '-1',
+      pageSize: '300',
+      pageNumber: '1',
+    });
+    if (rows.length > 0) return { date: cursor, rows };
+    cursor = isoMinusDays(cursor, 1);
+  }
+  return { date: dateIso, rows: [] };
+}
+
+function boardMatches(code: string, board: 'hs_a' | 'sh_a' | 'sz_a' | 'cyb'): boolean {
+  if (board === 'hs_a') return true;
+  if (board === 'sh_a') return /^(6|9)/.test(code);
+  if (board === 'cyb') return /^30/.test(code);
+  if (board === 'sz_a') return /^(0|3)/.test(code); // includes ChiNext, same as Sina's own sz_a grouping
+  return true;
 }
 
 async function turnoverRanking(args: Record<string, unknown>) {
@@ -1033,6 +1333,52 @@ async function turnoverRanking(args: Record<string, unknown>) {
   const board = (['hs_a', 'sh_a', 'sz_a', 'cyb'] as const).includes(boardArg as 'hs_a' | 'sh_a' | 'sz_a' | 'cyb')
     ? (boardArg as 'hs_a' | 'sh_a' | 'sz_a' | 'cyb')
     : 'hs_a';
+
+  const todayIso = isoToday();
+  const dateArg = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, todayIso) : null;
+  const isHistorical = !!dateArg && dateArg !== todayIso;
+
+  if (isHistorical) {
+    // Fixed fleet #2840: this used to silently answer a dated request with
+    // TODAY's live board (failure_mode: silent). Now it either serves a real
+    // historical ranking (changepercent) or throws a loud, specific error
+    // naming the gap -- no silent substitution either way.
+    if (sort !== 'changepercent') {
+      throw new Error(
+        `A past date (${dateArg}) was requested with sort:'${sort}', but no keyless historical bulk source for market-wide turnover amount or share volume BY DATE was found -- Sina's getHQNodeData (used for the live board) only serves today, and Eastmoney's one confirmed bulk per-day report (RPT_VALUEANALYSIS_DET) carries price/change%%/market-cap/industry but not turnover or volume. Only sort:'changepercent' is available for a past date. Omit \`date\` for today's live amount/volume ranking, or use sort:'changepercent' for ${dateArg}.`,
+      );
+    }
+    const { date: resolvedDate, rows: valueRows } = await historicalChangeRanking(dateArg, asc as '0' | '1');
+    if (valueRows.length === 0) {
+      return { board, sort, order: asc === '1' ? 'asc' : 'desc', date: dateArg, returned: 0, rows: [], message: `No historical ranking data found for ${dateArg} or the 8 trading days before it (too far in the past/future for this upstream, or not a trading day).` };
+    }
+    const filtered = valueRows.filter((r) => boardMatches(String(r.SECURITY_CODE ?? ''), board)).slice(0, want);
+    const rows = filtered.map((r) => ({
+      code: r.SECURITY_CODE ?? null,
+      name: r.SECURITY_NAME_ABBR ?? null,
+      price: num(r.CLOSE_PRICE),
+      change_pct: num(r.CHANGE_RATE) != null ? Math.round((num(r.CHANGE_RATE) as number) * 100) / 100 : null,
+      volume_shares: 'not_available',
+      amount_cny: 'not_available',
+      turnover_rate_pct: 'not_available',
+      total_market_cap_cny: num(r.TOTAL_MARKET_CAP),
+      industry: r.BOARD_NAME ?? 'not_available',
+      tick_time: null,
+    }));
+    return {
+      board,
+      sort,
+      order: asc === '1' ? 'asc' : 'desc',
+      date: resolvedDate,
+      date_note: resolvedDate === dateArg ? null : `${dateArg} had no data (weekend/holiday); walked back to the nearest prior trading day, ${resolvedDate}.`,
+      as_of: resolvedDate,
+      returned: rows.length,
+      note: "Historical path (past `date`): ranked by change % from Eastmoney's RPT_VALUEANALYSIS_DET bulk daily report, which carries price/change%/market-cap/industry but NOT turnover amount or volume -- those fields are 'not_available' here (see amount_cny/volume_shares/turnover_rate_pct). industry (BOARD_NAME) IS available on this path, unlike the live Sina path's per-call enrichment.",
+      source: 'Eastmoney datacenter-web RPT_VALUEANALYSIS_DET (keyless)',
+      rows,
+    };
+  }
+
   const params = new URLSearchParams({ page: '1', num: String(want), sort, asc, node: board });
   const res = await pwFetch(`${HQ_NODE_DATA}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://finance.sina.com.cn/' } });
   if (!res.ok) throw await httpError(res, 'Sina');
@@ -1043,27 +1389,280 @@ async function turnoverRanking(args: Record<string, unknown>) {
   } catch {
     return { board, sort, order: asc === '1' ? 'asc' : 'desc', returned: 0, rows: [], message: 'Sina returned a non-JSON response (likely off-hours or a transient block).' };
   }
-  const rows = raw.map((s) => ({
-    code: s.code ?? null,
-    name: s.name ?? null,
-    price: num(s.trade),
-    change: num(s.pricechange),
-    change_pct: num(s.changepercent) != null ? Math.round((num(s.changepercent) as number) * 100) / 100 : null,
-    volume_shares: num(s.volume),
-    amount_cny: num(s.amount),
-    turnover_rate_pct: num(s.turnoverratio) != null ? Math.round((num(s.turnoverratio) as number) * 100) / 100 : null,
-    industry: 'not_available',
-    tick_time: s.ticktime ?? null,
-  }));
+  // Industry enrichment (fleet #2840): the live Sina board carries no
+  // industry field at all, so resolve it with one extra bulk Eastmoney call
+  // keyed by the codes this call already returned -- best-effort, never
+  // throws (see industriesByCode), so a lookup failure degrades to
+  // 'not_available' exactly as before rather than failing the whole call.
+  const codes = raw.map((s) => String(s.code ?? ''));
+  const industryMap = await industriesByCode(codes);
+  const rows = raw.map((s) => {
+    const code = String(s.code ?? '');
+    return {
+      code: s.code ?? null,
+      name: s.name ?? null,
+      price: num(s.trade),
+      change: num(s.pricechange),
+      change_pct: num(s.changepercent) != null ? Math.round((num(s.changepercent) as number) * 100) / 100 : null,
+      volume_shares: num(s.volume),
+      amount_cny: num(s.amount),
+      turnover_rate_pct: num(s.turnoverratio) != null ? Math.round((num(s.turnoverratio) as number) * 100) / 100 : null,
+      industry: industryMap.get(code) ?? 'not_available',
+      tick_time: s.ticktime ?? null,
+    };
+  });
   return {
     board,
     sort,
     order: asc === '1' ? 'asc' : 'desc',
     as_of: rows[0]?.tick_time ?? null,
     returned: rows.length,
-    note: 'industry (行业) is not available from this Sina endpoint; use a per-code lookup elsewhere if needed. amount_cny is turnover (成交额) in CNY.',
-    source: 'Sina Market_Center.getHQNodeData (keyless)',
+    note: "industry (行业/板块) is resolved via a secondary Eastmoney lookup (RPT_VALUEANALYSIS_DET) by code and falls back to 'not_available' for any code it doesn't carry. amount_cny is turnover (成交额) in CNY. Pass `date` for a PAST trading day's ranking (sort:'changepercent' only -- see this tool's description for why amount/volume aren't available historically).",
+    source: 'Sina Market_Center.getHQNodeData (keyless) + Eastmoney RPT_VALUEANALYSIS_DET (industry enrichment, keyless)',
     rows,
+  };
+}
+
+// ── ashares_capital_flow ───────────────────────────────────────────────
+/** 6-digit code -> Eastmoney secid ("1.<code>" SSE, "0.<code>" SZSE/BSE). */
+function eastmoneySecId(code: string): string {
+  return sinaSym(code).startsWith('sh') ? `1.${code}` : `0.${code}`;
+}
+
+async function capitalFlow(args: Record<string, unknown>) {
+  const code = String(args.code ?? '').replace(/\D/g, '');
+  if (!/^\d{6}$/.test(code)) throw new Error('code must be a 6-digit A-share or ETF code, e.g. "000768" or "515050".');
+  const days = Math.min(Math.max(Number(args.days ?? 20), 1), 200);
+  const params = new URLSearchParams({
+    secid: eastmoneySecId(code),
+    fields1: 'f1,f2,f3,f7',
+    fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65',
+  });
+  const res = await pwFetch(`${FFLOW_DAYKLINE}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://data.eastmoney.com/' } });
+  if (!res.ok) throw await httpError(res, 'Eastmoney');
+  const body = (await res.json()) as { rc?: number; data?: { code?: string; market?: number; name?: string; klines?: string[] } | null };
+  if (!body.data || !Array.isArray(body.data.klines) || body.data.klines.length === 0) {
+    return { code, found: false, message: `No main-capital (主力) flow history for ${code} -- check the code; invalid/delisted codes come back with no klines rather than an error.` };
+  }
+  const allRows = body.data.klines.map((line) => {
+    const f = line.split(',');
+    return {
+      date: f[0],
+      main_net_inflow_cny: num(f[1]),
+      small_net_inflow_cny: num(f[2]),
+      medium_net_inflow_cny: num(f[3]),
+      large_net_inflow_cny: num(f[4]),
+      super_large_net_inflow_cny: num(f[5]),
+      main_net_inflow_pct: num(f[6]),
+      small_net_inflow_pct: num(f[7]),
+      medium_net_inflow_pct: num(f[8]),
+      large_net_inflow_pct: num(f[9]),
+      super_large_net_inflow_pct: num(f[10]),
+      close: num(f[11]),
+      change_pct: num(f[12]),
+    };
+  });
+  const rows = allRows.slice(-days);
+  const latest = rows[rows.length - 1] ?? null;
+  return {
+    code,
+    name: body.data.name ?? null,
+    exchange: exchangeOf(sinaSym(code)),
+    country: 'China',
+    market: 'China A-share market',
+    statement:
+      `China A-share market: ${rows.length} trading-day main-capital (主力) net-inflow row(s) for ${code}${body.data.name ? ` (${body.data.name})` : ''}, ` +
+      `${rows[0]?.date ?? 'n/a'} to ${latest?.date ?? 'n/a'}` +
+      (latest ? `; most recent day's main net inflow ¥${latest.main_net_inflow_cny?.toLocaleString() ?? 'n/a'}.` : '.'),
+    returned: rows.length,
+    note: "main_net_inflow_cny (主力净流入) = super_large_net_inflow_cny + large_net_inflow_cny (verified arithmetically against live data: the two sum exactly to the reported main figure). Positive = net buying pressure from that order-size bucket that day, negative = net selling. *_pct is that bucket's net inflow as a % of the day's total turnover. Order-size buckets (超大单/大单/中单/小单) are Eastmoney's own order-value classification, not configurable.",
+    source: 'Eastmoney push2his fflow/daykline (keyless)',
+    rows,
+  };
+}
+
+// ── ashares_billboard (龙虎榜) ──────────────────────────────────────────
+async function fetchBillboardList(dateIso: string, want: number): Promise<Array<Record<string, unknown>>> {
+  return dcQuery({
+    reportName: BILLBOARD_REPORT,
+    filter: `(TRADE_DATE='${dateIso}')`,
+    sortColumns: 'BILLBOARD_NET_AMT',
+    sortTypes: '-1',
+    pageSize: String(Math.max(want, 50)),
+    pageNumber: '1',
+  });
+}
+
+async function billboard(args: Record<string, unknown>) {
+  const want = Math.min(Math.max(Number(args.limit ?? 50), 1), 100);
+  const todayIso = isoToday();
+  const startIso = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, todayIso) : todayIso;
+
+  let cursor = startIso;
+  let rows: Array<Record<string, unknown>> = [];
+  let resolvedDate = cursor;
+  let tried = 0;
+  for (; tried < 8; tried++) {
+    rows = await fetchBillboardList(cursor, want);
+    if (rows.length > 0) { resolvedDate = cursor; break; }
+    cursor = isoMinusDays(cursor, 1);
+  }
+  if (rows.length === 0) {
+    return { date: startIso, found: false, message: `No 龙虎榜 (dragon-tiger list) data found for ${startIso} or the ${tried} trading day(s) before it (weekend/holiday run, or a date too far in the future).` };
+  }
+
+  const picked = rows.slice(0, want);
+  const codes = picked.map((r) => String(r.SECURITY_CODE ?? ''));
+  const [orgRows, branchRows] = await Promise.all([
+    dcQuery({
+      reportName: BILLBOARD_ORG_REPORT,
+      filter: `(TRADE_DATE>='${resolvedDate}')(TRADE_DATE<='${resolvedDate}')`,
+      sortColumns: 'NET_BUY_AMT',
+      sortTypes: '-1',
+      pageSize: '300',
+      pageNumber: '1',
+    }).catch(() => [] as Array<Record<string, unknown>>),
+    dcQuery({
+      reportName: BILLBOARD_BRANCH_REPORT,
+      filter: `(ONLIST_DATE>='${resolvedDate}')(ONLIST_DATE<='${resolvedDate}')`,
+      sortColumns: 'TOTAL_NETAMT',
+      sortTypes: '-1',
+      pageSize: '5',
+      pageNumber: '1',
+    }).catch(() => [] as Array<Record<string, unknown>>),
+  ]);
+
+  const orgByCode = new Map<string, Record<string, unknown>>();
+  for (const r of orgRows) {
+    const c = String(r.SECURITY_CODE ?? '');
+    if (c && !orgByCode.has(c)) orgByCode.set(c, r);
+  }
+  const relevantOrgCount = codes.filter((c) => orgByCode.has(c)).length;
+
+  const stocks = picked.map((r) => {
+    const code = String(r.SECURITY_CODE ?? '');
+    const org = orgByCode.get(code);
+    return {
+      code,
+      name: r.SECURITY_NAME_ABBR ?? null,
+      close_price: num(r.CLOSE_PRICE),
+      change_pct: num(r.CHANGE_RATE) != null ? Math.round((num(r.CHANGE_RATE) as number) * 100) / 100 : null,
+      turnover_rate_pct: num(r.TURNOVERRATE) != null ? Math.round((num(r.TURNOVERRATE) as number) * 100) / 100 : null,
+      billboard_buy_cny: num(r.BILLBOARD_BUY_AMT),
+      billboard_sell_cny: num(r.BILLBOARD_SELL_AMT),
+      billboard_net_cny: num(r.BILLBOARD_NET_AMT),
+      reason: r.EXPLANATION ?? null,
+      institution_net_buy_cny: org ? num(org.NET_BUY_AMT) : null,
+      institution_buy_seats: org ? num(org.BUY_TIMES) : null,
+      institution_sell_seats: org ? num(org.SELL_TIMES) : null,
+    };
+  });
+
+  const topBrokerages = branchRows.slice(0, 5).map((r) => ({
+    name: r.OPERATEDEPT_NAME ?? null,
+    net_buy_cny: num(r.TOTAL_NETAMT),
+    buy_amount_cny: num(r.TOTAL_BUYAMT),
+    sell_amount_cny: num(r.TOTAL_SELLAMT),
+    stocks_bought: typeof r.SECURITY_NAME_ABBR === 'string' ? r.SECURITY_NAME_ABBR.split(' ').filter(Boolean).slice(0, 5) : [],
+  }));
+
+  return {
+    date: resolvedDate,
+    date_note: resolvedDate === startIso ? null : `${startIso} had no 龙虎榜 data (weekend/holiday, or nothing flagged); walked back to the nearest prior trading day, ${resolvedDate}.`,
+    data_as_of: resolvedDate,
+    returned: stocks.length,
+    institution_seat_activity_count: relevantOrgCount,
+    note: "billboard_*_cny = the stock's total top-seat buy/sell/net amount on the 龙虎榜 that day (CNY). institution_* fields are populated only for the subset of these stocks that ALSO had a 机构专用 (institution-designated) seat trade that day -- most billboard stocks do not, and null here means none, not missing data. top_brokerages is that day's most-active brokerage BRANCHES market-wide (not specific to these listed stocks) -- the closest keyless proxy found for a 'top-5 brokerages' signal on a billboard date; stocks_bought lists a sample of what each branch traded that day.",
+    top_brokerages: topBrokerages,
+    source: 'Eastmoney datacenter-web RPT_DAILYBILLBOARD_DETAILSNEW + RPT_ORGANIZATION_TRADE_DETAILSNEW + RPT_OPERATEDEPT_ACTIVE (keyless)',
+    stocks,
+  };
+}
+
+// ── ashares_etf_shares ──────────────────────────────────────────────────
+/** '' and null both mean "not disclosed this period" in Eastmoney's fund F10
+ * JSON -- unlike `num()`, this must NOT coerce '' to 0 (Number('') === 0). */
+function etfNum(v: unknown): number | null {
+  if (v === '' || v == null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchEtfShareHistory(code: string): Promise<Array<Record<string, unknown>>> {
+  const params = new URLSearchParams({ type: 'gmbd', code, page: '1' });
+  const res = await pwFetch(`${ETF_SHARES_ARCHIVE}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: `https://fund.eastmoney.com/${code}.html` } });
+  if (!res.ok) throw await httpError(res, 'Eastmoney fund F10');
+  const text = await res.text();
+  // The endpoint returns `var gmbd_apidata={ content:"<html table>", summary:"...", data:[{...}] };`
+  // -- content/summary are an HTML table and a prose string (both quoted with
+  // escaped internals); `data` is the one genuinely structured piece, so
+  // extract and parse just that array rather than scraping the HTML table.
+  const m = text.trim().match(/"data"\s*:\s*(\[\{[\s\S]*\}\])\s*\}\s*;?\s*$/);
+  if (!m) return [];
+  try {
+    return JSON.parse(m[1]) as Array<Record<string, unknown>>;
+  } catch {
+    return [];
+  }
+}
+
+async function etfShares(args: Record<string, unknown>) {
+  const code = String(args.code ?? '').replace(/\D/g, '');
+  if (!/^\d{6}$/.test(code)) throw new Error('code must be a 6-digit ETF code, e.g. "515050".');
+  const today = isoToday();
+  const fromIso = typeof args.from === 'string' && args.from.trim() ? isoDate(args.from, '1900-01-01') : null;
+  const toIso = typeof args.to === 'string' && args.to.trim() ? isoDate(args.to, today) : null;
+
+  const raw = await fetchEtfShareHistory(code);
+  if (raw.length === 0) {
+    return { code, found: false, message: `No fund-share disclosure history found for ${code} -- check the code (this tool is for Eastmoney-covered ETFs/LOFs with a fund F10 page), or the fund may be too new to have disclosed yet.` };
+  }
+  const all = raw
+    .map((r) => ({
+      date: String(r.FSRQ ?? ''),
+      name: (r.SHORTNAME as string | undefined) ?? null,
+      period_subscriptions_shares: etfNum(r.QJSG),
+      period_redemptions_shares: etfNum(r.QJSH),
+      period_end_total_shares: etfNum(r.QMZFE),
+      period_end_net_assets_cny: etfNum(r.QMJZC) ?? etfNum(r.NETNAV),
+      net_assets_change_pct: etfNum(r.CHANGE),
+    }))
+    .filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date))
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)); // newest first
+
+  const windowed = all.filter((r) => (!fromIso || r.date >= fromIso) && (!toIso || r.date <= toIso));
+
+  if (windowed.length === 0) {
+    const before = all.find((r) => !toIso || r.date <= toIso) ?? null;
+    const after = [...all].reverse().find((r) => !fromIso || r.date >= fromIso) ?? null;
+    return {
+      code,
+      found: false,
+      requested_from: fromIso,
+      requested_to: toIso,
+      message:
+        `No fund-share disclosure falls inside ${fromIso ?? '(no lower bound)'}..${toIso ?? '(no upper bound)'} for ${code}. ` +
+        'Chinese ETFs disclose 基金份额 at quarter-end plus occasional ad-hoc dates, not daily -- try widening the range.' +
+        (before ? ` Nearest disclosure at/before the window: ${before.date} (${before.period_end_total_shares?.toLocaleString() ?? 'n/a'} shares).` : '') +
+        (after ? ` Nearest at/after: ${after.date} (${after.period_end_total_shares?.toLocaleString() ?? 'n/a'} shares).` : ''),
+      all_disclosure_dates: all.slice(0, 12).map((r) => r.date),
+    };
+  }
+
+  return {
+    code,
+    name: windowed[0]?.name ?? null,
+    found: true,
+    country: 'China',
+    market: 'China A-share/ETF market',
+    statement:
+      `China-listed ETF ${code}${windowed[0]?.name ? ` (${windowed[0].name})` : ''}: ${windowed.length} disclosed fund-share record(s) ` +
+      `between ${windowed[windowed.length - 1]?.date} and ${windowed[0]?.date}.`,
+    returned: windowed.length,
+    note:
+      "period_end_total_shares (期末总份额) and period_subscriptions/redemptions_shares (期间申购/赎回) are in raw SHARE units (confirmed ×1e8 against the source's own 亿份-denominated HTML table). period_end_net_assets_cny (期末净资产) is raw CNY. This is a DISCLOSURE-DATE series (quarter-end plus occasional ad-hoc material-change dates, e.g. this ETF may have one off-cycle date) -- NOT a literal daily series; no Eastmoney or exchange source publishes a daily retail-accessible 份额 count. For daily PRICE history use ashares_daily_history.",
+    source: 'Eastmoney fund F10 archive (FundArchivesDatas.aspx?type=gmbd, keyless)',
+    rows: windowed,
   };
 }
 
@@ -1133,6 +1732,196 @@ async function datacenter(reportName: string, code: string, extra: Record<string
   };
   // Unknown codes come back success:false / result:null, not an HTTP error.
   return body.result?.data ?? [];
+}
+
+// ── ashares_margin_financing ───────────────────────────────────────────
+type SzseMarginRow = { jrrzmr: string; jrrzye: string; jrrjmc: string; jrrjyl: string; jrrjye: string; jrrzrjye: string };
+
+async function fetchSzseMarginTotal(dateIso: string): Promise<{ found: boolean; date: string | null; row: SzseMarginRow | null }> {
+  const params = new URLSearchParams({ SHOWTYPE: 'JSON', CATALOGID: '1837_xxpl', TABKEY: 'tab1', txtDate: dateIso });
+  const res = await pwFetch(`${SZSE_MARGIN}?${params}`, { headers: { Referer: SZSE_MARGIN_REFERER, 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+  if (!res.ok) throw await httpError(res, 'SZSE');
+  const body = (await res.json()) as Array<{ metadata?: { subname?: string }; data?: SzseMarginRow[] }>;
+  const subname = body[0]?.metadata?.subname;
+  const row = body[0]?.data?.[0] ?? null;
+  return { found: !!subname && !!row, date: subname || null, row };
+}
+
+/** Walk back from `fromIso` (inclusive) until SZSE has a published margin total — covers weekends/holidays and the T+1 publication lag. */
+async function szseMarginLatest(fromIso: string, maxTries = 12): Promise<{ found: boolean; date: string | null; row: SzseMarginRow | null; tried: number }> {
+  let cursor = fromIso;
+  for (let i = 0; i < maxTries; i++) {
+    const r = await fetchSzseMarginTotal(cursor);
+    if (r.found) return { ...r, tried: i + 1 };
+    cursor = isoMinusDays(cursor, 1);
+  }
+  return { found: false, date: null, row: null, tried: maxTries };
+}
+
+async function fetchSzseMarginStock(dateIso: string, code: string): Promise<{ found: boolean; date: string | null; row: (SzseMarginRow & { zqdm?: string; zqjc?: string }) | null }> {
+  const params = new URLSearchParams({ SHOWTYPE: 'JSON', CATALOGID: '1837_xxpl', TABKEY: 'tab2', txtDate: dateIso, txtZqdm: code });
+  const res = await pwFetch(`${SZSE_MARGIN}?${params}`, { headers: { Referer: SZSE_MARGIN_REFERER, 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+  if (!res.ok) throw await httpError(res, 'SZSE');
+  const body = (await res.json()) as Array<{ metadata?: { subname?: string }; data?: Array<SzseMarginRow & { zqdm?: string; zqjc?: string }> }>;
+  const subname = body[0]?.metadata?.subname;
+  const row = body[0]?.data?.[0] ?? null;
+  return { found: !!subname && !!row, date: subname || null, row };
+}
+
+type SseMarginRow = { opDate?: string; rzye?: number; rzmre?: number; rzche?: number; rqye?: number; rqylje?: number; rqmcl?: number; rqyl?: number; rzrqjyzl?: number };
+
+async function fetchSseMarginRows(pageSize: number): Promise<SseMarginRow[]> {
+  const params = new URLSearchParams({
+    isPagination: 'true',
+    'pageHelp.pageSize': String(pageSize),
+    'pageHelp.pageNo': '1',
+    'pageHelp.beginPage': '1',
+    'pageHelp.endPage': '1',
+    'pageHelp.cacheSize': '1',
+    _: `${Date.now()}`,
+  });
+  const res = await pwFetch(`${SSE_MARGIN}?${params}`, { headers: { Referer: 'https://www.sse.com.cn/', 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+  if (!res.ok) throw await httpError(res, 'SSE');
+  const body = (await res.json()) as { pageHelp?: { data?: SseMarginRow[] } };
+  return body.pageHelp?.data ?? [];
+}
+
+function isSzseCode(code: string): boolean {
+  // SZSE main board (0xxxxx), ChiNext (30xxxx), SZSE-listed ETFs (159xxx).
+  return /^(0|3)\d{5}$/.test(code) || /^159\d{3}$/.test(code);
+}
+function isSseCode(code: string): boolean {
+  return /^(6|5|9)\d{5}$/.test(code);
+}
+
+async function marginFinancing(args: Record<string, unknown>) {
+  const symbolRaw = typeof args.symbol === 'string' ? args.symbol.replace(/\D/g, '') : '';
+
+  if (symbolRaw) {
+    if (!/^\d{6}$/.test(symbolRaw)) throw new Error('symbol must be a 6-digit code, e.g. "000001".');
+    if (isSseCode(symbolRaw)) {
+      return {
+        symbol: symbolRaw,
+        exchange: 'Shanghai Stock Exchange (SSE)',
+        found: false,
+        message: `No verified keyless per-stock margin-financing (融资融券) route exists for SSE-listed codes (${symbolRaw} is 6xxxxx). Per-stock detail is confirmed available for SZSE codes only (0/3/159-prefixed) — use the market-wide aggregate (omit symbol) for SSE-side totals.`,
+      };
+    }
+    if (!isSzseCode(symbolRaw)) {
+      return { symbol: symbolRaw, found: false, message: `${symbolRaw} does not look like a recognized SSE or SZSE code.` };
+    }
+    const dateArg = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, isoToday()) : isoToday();
+    let cursor = dateArg;
+    let hit: { found: boolean; date: string | null; row: (SzseMarginRow & { zqdm?: string; zqjc?: string }) | null } | null = null;
+    for (let i = 0; i < 12; i++) {
+      const r = await fetchSzseMarginStock(cursor, symbolRaw);
+      if (r.found) { hit = r; break; }
+      cursor = isoMinusDays(cursor, 1);
+    }
+    if (!hit || !hit.row) {
+      return { symbol: symbolRaw, exchange: 'Shenzhen Stock Exchange (SZSE)', found: false, message: `No margin-financing detail found for ${symbolRaw} in the last 12 calendar days (not on the margin-eligible list, invalid code, or not yet published).` };
+    }
+    const r = hit.row;
+    return {
+      symbol: symbolRaw,
+      name: r.zqjc ?? null,
+      exchange: 'Shenzhen Stock Exchange (SZSE)',
+      date: hit.date,
+      found: true,
+      financing_buy_cny: (cnNum(r.jrrzmr) ?? 0) * 1e8,
+      financing_balance_cny: (cnNum(r.jrrzye) ?? 0) * 1e8,
+      lending_sellout_shares: (cnNum(r.jrrjmc) ?? 0) * 1e4,
+      lending_balance_shares: (cnNum(r.jrrjyl) ?? 0) * 1e4,
+      // NOTE: tab2's jrrjye (融券余额) is in 万元, NOT 亿元 like tab1 — confirmed
+      // live 2026-10-08. Using the tab1 ×1e8 factor here would be a 10,000×
+      // error, not a plausible-looking 100× one.
+      lending_balance_cny: (cnNum(r.jrrjye) ?? 0) * 1e4,
+      combined_balance_cny: (cnNum(r.jrrzrjye) ?? 0) * 1e8,
+      source: 'SZSE ShowReport CATALOGID=1837_xxpl tab2 (融资融券交易明细), keyless',
+    };
+  }
+
+  // Market-wide aggregate: SSE's own list is already sorted newest-first with
+  // no date param, so just pull 3 rows for latest + day-over-day change. SZSE
+  // needs an explicit date and fails CLOSED on an unpublished one (empty data,
+  // not an error), so walk back from today.
+  const sseRows = await fetchSseMarginRows(3);
+  if (sseRows.length === 0) throw new Error('SSE margin endpoint returned no rows at all — treat as an upstream failure, not "no margin trading today".');
+  const sse = sseRows[0];
+  const ssePrior = sseRows[1] ?? null;
+  const sseDateIso = ymdToIso(sse.opDate) ?? isoToday();
+
+  const szseLatest = await szseMarginLatest(sseDateIso);
+  const szsePrior = szseLatest.date ? await szseMarginLatest(isoMinusDays(szseLatest.date, 1)) : null;
+
+  const sseFinancing = num(sse.rzye) ?? 0;
+  const sseLending = num(sse.rqylje) ?? 0;
+  const sseCombined = num(sse.rzrqjyzl) ?? (sseFinancing + sseLending);
+  const ssePriorFinancing = ssePrior ? num(ssePrior.rzye) ?? null : null;
+  const ssePriorCombined = ssePrior ? num(ssePrior.rzrqjyzl) ?? null : null;
+
+  const szseRow = szseLatest.row;
+  const szseFinancing = szseRow ? (cnNum(szseRow.jrrzye) ?? 0) * 1e8 : null;
+  const szseLending = szseRow ? (cnNum(szseRow.jrrjye) ?? 0) * 1e8 : null; // tab1 IS 亿元 — different from tab2 above.
+  const szseCombined = szseRow ? (cnNum(szseRow.jrrzrjye) ?? 0) * 1e8 : null;
+  const szsePriorFinancing = szsePrior?.row ? (cnNum(szsePrior.row.jrrzye) ?? 0) * 1e8 : null;
+  const szsePriorCombined = szsePrior?.row ? (cnNum(szsePrior.row.jrrzrjye) ?? 0) * 1e8 : null;
+
+  const datesMatch = szseLatest.date === sseDateIso;
+
+  const marketFinancing = szseFinancing != null ? sseFinancing + szseFinancing : null;
+  const marketCombined = szseCombined != null ? sseCombined + szseCombined : null;
+  const marketFinancingPrior = ssePriorFinancing != null && szsePriorFinancing != null ? ssePriorFinancing + szsePriorFinancing : null;
+  const marketCombinedPrior = ssePriorCombined != null && szsePriorCombined != null ? ssePriorCombined + szsePriorCombined : null;
+
+  return {
+    country: 'China',
+    market: 'China A-share market (SSE + SZSE)',
+    as_of: sseDateIso,
+    date_note: datesMatch
+      ? null
+      : `SSE's latest published margin date is ${sseDateIso} but SZSE's latest is ${szseLatest.date ?? 'not found in the last 12 days'} — the two figures below are NOT for the same trading day; treat market-wide totals as unavailable until they align.`,
+    statement:
+      `China A-share market margin financing (融资融券余额) as of ${sseDateIso}: SSE financing balance ¥${sseFinancing.toLocaleString()}, ` +
+      (szseFinancing != null ? `SZSE financing balance ¥${szseFinancing.toLocaleString()} (as of ${szseLatest.date}), combined ¥${(marketFinancing ?? 0).toLocaleString()}.` : 'SZSE figure unavailable.'),
+    exchanges: {
+      sse: {
+        date: sseDateIso,
+        financing_balance_cny: sseFinancing,
+        financing_buy_cny: num(sse.rzmre),
+        financing_repay_cny: num(sse.rzche),
+        lending_balance_cny: sseLending,
+        lending_balance_shares: num(sse.rqyl),
+        lending_sellout_shares: num(sse.rqmcl),
+        combined_balance_cny: sseCombined,
+        change_financing_cny_dod: ssePriorFinancing != null ? Math.round(sseFinancing - ssePriorFinancing) : null,
+        change_combined_cny_dod: ssePriorCombined != null ? Math.round(sseCombined - ssePriorCombined) : null,
+      },
+      szse: szseRow
+        ? {
+            date: szseLatest.date,
+            financing_balance_cny: szseFinancing,
+            financing_buy_cny: (cnNum(szseRow.jrrzmr) ?? 0) * 1e8,
+            lending_balance_cny: szseLending,
+            lending_balance_100m_shares: cnNum(szseRow.jrrjyl),
+            lending_sellout_100m_shares: cnNum(szseRow.jrrjmc),
+            combined_balance_cny: szseCombined,
+            change_financing_cny_dod: szsePriorFinancing != null && szseFinancing != null ? Math.round(szseFinancing - szsePriorFinancing) : null,
+            change_combined_cny_dod: szsePriorCombined != null && szseCombined != null ? Math.round(szseCombined - szsePriorCombined) : null,
+          }
+        : { found: false, message: `No SZSE margin total published in the 12 calendar days up to ${sseDateIso}.` },
+    },
+    market_wide: {
+      financing_balance_cny: marketFinancing,
+      combined_margin_balance_cny: marketCombined,
+      change_financing_cny_dod: marketFinancingPrior != null && marketFinancing != null ? Math.round(marketFinancing - marketFinancingPrior) : null,
+      change_combined_cny_dod: marketCombinedPrior != null && marketCombined != null ? Math.round(marketCombined - marketCombinedPrior) : null,
+      unavailable_reason: marketFinancing == null ? 'SZSE figure for this date could not be found.' : null,
+    },
+    note:
+      'financing_balance_cny = 融资余额 (money borrowed to buy stock); lending_balance_cny = 融券余额 (value of shares borrowed to short); combined_balance_cny = 融资融券余额. Margin data publishes T+1, so a weekday morning request often resolves to yesterday\'s figures. SSE fields are native CNY (元); SZSE tab1 fields are native 亿元, converted here ×1e8 — do not reuse that factor for ashares_margin_financing({symbol}), whose SZSE per-stock source (tab2) reports 融券余额 in 万元 (×1e4) instead.',
+    source: 'SSE query.sse.com.cn/marketdata/tradedata/queryMargin.do (keyless) + SZSE www.szse.cn ShowReport CATALOGID=1837_xxpl tab1 (keyless)',
+  };
 }
 
 async function earningsForecast(args: Record<string, unknown>) {
@@ -1634,10 +2423,20 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return marketSnapshot();
     case 'ashares_limit_up':
       return limitUp(args);
+    case 'ashares_limit_down':
+      return limitDown(args);
+    case 'ashares_margin_financing':
+      return marginFinancing(args);
     case 'ashares_quote':
       return quote(args);
     case 'ashares_turnover_ranking':
       return turnoverRanking(args);
+    case 'ashares_capital_flow':
+      return capitalFlow(args);
+    case 'ashares_billboard':
+      return billboard(args);
+    case 'ashares_etf_shares':
+      return etfShares(args);
     case 'ashares_earnings_forecast':
       return earningsForecast(args);
     case 'ashares_analyst_consensus':
