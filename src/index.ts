@@ -697,8 +697,8 @@ function collapse(s: string): string {
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
 // until its own execution budget kills the request (minutes, not seconds).
 // Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'China A-shares');
+async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number): Promise<Response> {
+  return fetchWithTimeout(url, init ?? {}, 'China A-shares', timeoutMs);
 }
 
 const ZT_POOL = 'https://push2ex.eastmoney.com/getTopicZTPool';
@@ -1098,24 +1098,72 @@ const tools: McpToolExport['tools'] = [
 ];
 
 // ── handlers ─────────────────────────────────────────────────────────
-async function limitUp(args: Record<string, unknown>) {
-  const date = (typeof args.date === 'string' && args.date.trim() ? args.date.replace(/-/g, '') : latestTradingDate()).slice(0, 8);
-  const want = Math.min(Math.max(Number(args.limit ?? 30), 1), 100);
+// ── Eastmoney limit boards (涨停 ZT / 跌停 DT) ───────────────────────────
+// The response's `qdate` is ALWAYS the latest trading day, whatever `date`
+// was asked for, while `tc` and the pool ARE for the requested day. Verified
+// 2026-10-10: date=20260930 -> tc 52, qdate 20261009; date=20261009 -> tc 69,
+// qdate 20261009, different stocks, 紫竹高科's streak 2 vs 4. The tools used
+// to label every answer with qdate, so "limit-ups on 09-30" came back as
+// 09-30's count stamped 10-09 (fleet #2831). The day a pool is FOR is the
+// day we asked.
+//
+// A non-trading day and a day older than the ~20-trading-day retention
+// window (20260911 -> tc 40, 20260908 -> tc 0) both come back as tc 0 with
+// an empty pool — indistinguishable from a real zero. Zero limit-downs IS a
+// real outcome on a strong day, so an empty DT board is only believed when
+// the ZT board for the same day is non-empty.
+type LimitPool = { tc: number; latest: string | null; pool: Array<Record<string, unknown>> };
+
+async function fetchLimitPool(kind: 'up' | 'down', date: string, pagesize: number): Promise<LimitPool | null> {
   const params = new URLSearchParams({
     ut: '7eea3edcaed734bea9cbfc24409ed989',
     dpt: 'wz.ztzt',
     Pageindex: '0',
-    pagesize: String(Math.max(want, 100)),
-    sort: 'fbt:asc',
+    pagesize: String(pagesize),
+    sort: kind === 'up' ? 'fbt:asc' : 'fund:asc',
     date,
   });
-  const res = await pwFetch(`${ZT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
+  const res = await pwFetch(`${kind === 'up' ? ZT_POOL : DT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
   if (!res.ok) throw await httpError(res, 'Eastmoney');
   const body = (await res.json()) as { rc?: number; data?: { tc?: number; qdate?: number; pool?: Array<Record<string, unknown>> } | null };
-  if (!body.data || !Array.isArray(body.data.pool)) {
-    return { date, found: false, message: `No limit-up data for ${date} (not a trading day, or data not yet published).` };
+  if (!body.data || !Array.isArray(body.data.pool)) return null;
+  return { tc: body.data.tc ?? body.data.pool.length, latest: body.data.qdate != null ? String(body.data.qdate) : null, pool: body.data.pool };
+}
+
+/** Which day to read, and whether Eastmoney actually has it. No `requested` = the latest trading day. */
+async function resolveLimitBoard(kind: 'up' | 'down', requested: string | null, pagesize: number): Promise<{ found: true; date: string; board: LimitPool } | { found: false; date: string; latest: string | null }> {
+  const believable = async (date: string, b: LimitPool | null): Promise<boolean> => {
+    if (!b) return false;
+    if (b.tc > 0) return true;
+    if (kind === 'up') return false;
+    const up = await fetchLimitPool('up', date, 1);
+    return !!up && up.tc > 0;
+  };
+  const d = requested ?? latestTradingDate();
+  const first = await fetchLimitPool(kind, d, pagesize);
+  if (await believable(d, first)) return { found: true, date: d, board: first! };
+  const latest = first?.latest ?? null;
+  if (!requested && latest && latest !== d) {
+    const again = await fetchLimitPool(kind, latest, pagesize);
+    if (await believable(latest, again)) return { found: true, date: latest, board: again! };
   }
-  const pool = body.data.pool.slice(0, want).map((s) => ({
+  return { found: false, date: d, latest };
+}
+
+function limitNotFound(kind: 'up' | 'down', date: string, latest: string | null) {
+  return {
+    date,
+    found: false,
+    message: `No limit-${kind} board for ${date}: either it was not a trading day, or it is older than Eastmoney's retention window (about the last 20 trading days${latest ? `; the latest trading day is ${latest}` : ''}). This is NOT a count of zero.`,
+  };
+}
+
+async function limitUp(args: Record<string, unknown>) {
+  const requested = typeof args.date === 'string' && args.date.trim() ? args.date.replace(/-/g, '').slice(0, 8) : null;
+  const want = Math.min(Math.max(Number(args.limit ?? 30), 1), 100);
+  const r = await resolveLimitBoard('up', requested, Math.max(want, 100));
+  if (!r.found) return limitNotFound('up', r.date, r.latest);
+  const pool = r.board.pool.slice(0, want).map((s) => ({
     code: s.c ?? null,
     name: s.n ?? null,
     price: price(s.p),
@@ -1131,8 +1179,8 @@ async function limitUp(args: Record<string, unknown>) {
     industry: s.hybk ?? null,
   }));
   return {
-    date: String(body.data.qdate ?? date),
-    limit_up_count: body.data.tc ?? pool.length,
+    date: r.date,
+    limit_up_count: r.board.tc,
     returned: pool.length,
     note: 'Daily price limit is +10% for main-board A-shares, +20% for STAR (688xxx) and ChiNext (30xxxx). consecutive_boards>1 = a multi-day 连板 streak.',
     stocks: pool,
@@ -1140,23 +1188,11 @@ async function limitUp(args: Record<string, unknown>) {
 }
 
 async function limitDown(args: Record<string, unknown>) {
-  const date = (typeof args.date === 'string' && args.date.trim() ? args.date.replace(/-/g, '') : latestTradingDate()).slice(0, 8);
+  const requested = typeof args.date === 'string' && args.date.trim() ? args.date.replace(/-/g, '').slice(0, 8) : null;
   const want = Math.min(Math.max(Number(args.limit ?? 30), 1), 100);
-  const params = new URLSearchParams({
-    ut: '7eea3edcaed734bea9cbfc24409ed989',
-    dpt: 'wz.ztzt',
-    Pageindex: '0',
-    pagesize: String(Math.max(want, 100)),
-    sort: 'fund:asc',
-    date,
-  });
-  const res = await pwFetch(`${DT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
-  if (!res.ok) throw await httpError(res, 'Eastmoney');
-  const body = (await res.json()) as { rc?: number; data?: { tc?: number; qdate?: number; pool?: Array<Record<string, unknown>> } | null };
-  if (!body.data || !Array.isArray(body.data.pool)) {
-    return { date, found: false, message: `No limit-down data for ${date} (not a trading day, or data not yet published).` };
-  }
-  const pool = body.data.pool.slice(0, want).map((s) => ({
+  const r = await resolveLimitBoard('down', requested, Math.max(want, 100));
+  if (!r.found) return limitNotFound('down', r.date, r.latest);
+  const pool = r.board.pool.slice(0, want).map((s) => ({
     code: s.c ?? null,
     name: s.n ?? null,
     price: price(s.p),
@@ -1170,8 +1206,8 @@ async function limitDown(args: Record<string, unknown>) {
     industry: s.hybk ?? null,
   }));
   return {
-    date: String(body.data.qdate ?? date),
-    limit_down_count: body.data.tc ?? pool.length,
+    date: r.date,
+    limit_down_count: r.board.tc,
     returned: pool.length,
     note: 'Daily price limit is -10% for main-board A-shares, -20% for STAR (688xxx) and ChiNext (30xxxx). Counterpart to ashares_limit_up.',
     stocks: pool,
@@ -1213,25 +1249,14 @@ async function marketSnapshot() {
   // Limit-up / limit-down counts (涨跌停家数) — headline breadth/sentiment
   // gauges for A-shares. Two independent best-effort calls so one failing
   // doesn't blank out the other.
-  let limitUpCount: number | null = null;
-  let limitDownCount: number | null = null;
-  const date = latestTradingDate();
-  try {
-    const params = new URLSearchParams({ ut: '7eea3edcaed734bea9cbfc24409ed989', dpt: 'wz.ztzt', Pageindex: '0', pagesize: '1', sort: 'fbt:asc', date });
-    const res = await pwFetch(`${ZT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
-    if (res.ok) {
-      const body = (await res.json()) as { data?: { tc?: number } | null };
-      limitUpCount = body.data?.tc ?? null;
-    }
-  } catch { /* breadth best-effort */ }
-  try {
-    const params = new URLSearchParams({ ut: '7eea3edcaed734bea9cbfc24409ed989', dpt: 'wz.ztzt', Pageindex: '0', pagesize: '1', sort: 'fund:asc', date });
-    const res = await pwFetch(`${DT_POOL}?${params}`, { headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://quote.eastmoney.com/' } });
-    if (res.ok) {
-      const body = (await res.json()) as { data?: { tc?: number } | null };
-      limitDownCount = body.data?.tc ?? null;
-    }
-  } catch { /* breadth best-effort */ }
+  const [up, down] = await Promise.all([
+    resolveLimitBoard('up', null, 1).catch(() => null),
+    resolveLimitBoard('down', null, 1).catch(() => null),
+  ]);
+  const limitUpCount = up?.found ? up.board.tc : null;
+  const limitDownCount = down?.found ? down.board.tc : null;
+  const limitCountsDate = up?.found ? up.date : down?.found ? down.date : null;
+  const date = limitCountsDate ?? latestTradingDate();
 
   return {
     market: 'China A-shares (Shanghai / Shenzhen / STAR / ChiNext)',
@@ -1239,6 +1264,7 @@ async function marketSnapshot() {
     indices,
     limit_up_count: limitUpCount,
     limit_down_count: limitDownCount,
+    limit_counts_date: limitCountsDate,
     note: 'Index turnover is in CNY. limit_up_count/limit_down_count = number of A-shares that closed at their daily +10%/-10% price limit (+20%/-20% for STAR/ChiNext) — market-sentiment gauges. Use ashares_limit_up / ashares_limit_down for the ranked pools, and ashares_margin_financing for market-wide leverage (融资融券余额). Source: Sina (indices) + Eastmoney (limit counts), keyless.',
   };
 }
@@ -1739,7 +1765,7 @@ type SzseMarginRow = { jrrzmr: string; jrrzye: string; jrrjmc: string; jrrjyl: s
 
 async function fetchSzseMarginTotal(dateIso: string): Promise<{ found: boolean; date: string | null; row: SzseMarginRow | null }> {
   const params = new URLSearchParams({ SHOWTYPE: 'JSON', CATALOGID: '1837_xxpl', TABKEY: 'tab1', txtDate: dateIso });
-  const res = await pwFetch(`${SZSE_MARGIN}?${params}`, { headers: { Referer: SZSE_MARGIN_REFERER, 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+  const res = await pwFetch(`${SZSE_MARGIN}?${params}`, { headers: { Referer: SZSE_MARGIN_REFERER, 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } }, MARGIN_FETCH_MS);
   if (!res.ok) throw await httpError(res, 'SZSE');
   const body = (await res.json()) as Array<{ metadata?: { subname?: string }; data?: SzseMarginRow[] }>;
   const subname = body[0]?.metadata?.subname;
@@ -1747,15 +1773,43 @@ async function fetchSzseMarginTotal(dateIso: string): Promise<{ found: boolean; 
   return { found: !!subname && !!row, date: subname || null, row };
 }
 
-/** Walk back from `fromIso` (inclusive) until SZSE has a published margin total — covers weekends/holidays and the T+1 publication lag. */
-async function szseMarginLatest(fromIso: string, maxTries = 12): Promise<{ found: boolean; date: string | null; row: SzseMarginRow | null; tried: number }> {
-  let cursor = fromIso;
-  for (let i = 0; i < maxTries; i++) {
-    const r = await fetchSzseMarginTotal(cursor);
-    if (r.found) return { ...r, tried: i + 1 };
-    cursor = isoMinusDays(cursor, 1);
-  }
-  return { found: false, date: null, row: null, tried: maxTries };
+// Eastmoney's 两融 history split by exchange (RPTA_RZRQ_LSDB) — H_ columns are
+// SSE, S_ columns SZSE, amounts in native CNY, share counts in shares. It is
+// the FALLBACK leg for whichever exchange's own endpoint does not answer from
+// Worker egress: on 2026-10-09/10 query.sse.com.cn returned HTTP 500 to the
+// gateway while a laptop got 200 for the same request, and a throwaway CF
+// Worker saw SZSE time out at 20s on one probe and answer in 1.4s on the next
+// (fleet #2831). Cross-checked equal to the exchanges' own figures for
+// 2026-09-30, 10-08 and 10-09: H_RZYE = SSE rzye, H_RQYE = rqylje,
+// H_RZRQYE = rzrqjyzl; S_RZYE = SZSE jrrzye ×1e8. A row exists for a date
+// before SZSE has published it, with every S_ column null — so null means
+// "not published yet", never zero.
+type EmMarginRow = {
+  DIM_DATE?: string;
+  H_RZYE?: number | null; H_RQYE?: number | null; H_RZRQYE?: number | null; H_RZMRE?: number | null; H_RQYL?: number | null; H_RQMCL?: number | null;
+  S_RZYE?: number | null; S_RQYE?: number | null; S_RZRQYE?: number | null; S_RZMRE?: number | null; S_RQYL?: number | null; S_RQMCL?: number | null;
+};
+// Per-fetch bound for the margin legs. Three run in parallel and the gateway
+// gives a single-tool answer 20s, so one hung exchange must not eat it all.
+const MARGIN_FETCH_MS = 6_000;
+
+async function fetchEmMarginRows(pageSize: number, endIso: string): Promise<EmMarginRow[]> {
+  const params = new URLSearchParams({
+    reportName: 'RPTA_RZRQ_LSDB',
+    columns: 'ALL',
+    source: 'WEB',
+    sortColumns: 'DIM_DATE',
+    sortTypes: '-1',
+    pageNumber: '1',
+    pageSize: String(pageSize),
+    filter: `(DIM_DATE<='${endIso}')`,
+  });
+  const res = await pwFetch(`${DATACENTER}?${params}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (pipeworx.io)', Referer: 'https://data.eastmoney.com/' },
+  }, MARGIN_FETCH_MS);
+  if (!res.ok) throw await httpError(res, 'Eastmoney datacenter');
+  const body = (await res.json()) as { result?: { data?: EmMarginRow[] } | null };
+  return body.result?.data ?? [];
 }
 
 async function fetchSzseMarginStock(dateIso: string, code: string): Promise<{ found: boolean; date: string | null; row: (SzseMarginRow & { zqdm?: string; zqjc?: string }) | null }> {
@@ -1770,9 +1824,12 @@ async function fetchSzseMarginStock(dateIso: string, code: string): Promise<{ fo
 
 type SseMarginRow = { opDate?: string; rzye?: number; rzmre?: number; rzche?: number; rqye?: number; rqylje?: number; rqmcl?: number; rqyl?: number; rzrqjyzl?: number };
 
-async function fetchSseMarginRows(pageSize: number): Promise<SseMarginRow[]> {
+async function fetchSseMarginRows(pageSize: number, endIso: string): Promise<SseMarginRow[]> {
   const params = new URLSearchParams({
     isPagination: 'true',
+    // Bounds the newest-first list so a past `date` resolves on or before it.
+    beginDate: isoMinusDays(endIso, 30).replace(/-/g, ''),
+    endDate: endIso.replace(/-/g, ''),
     'pageHelp.pageSize': String(pageSize),
     'pageHelp.pageNo': '1',
     'pageHelp.beginPage': '1',
@@ -1780,7 +1837,7 @@ async function fetchSseMarginRows(pageSize: number): Promise<SseMarginRow[]> {
     'pageHelp.cacheSize': '1',
     _: `${Date.now()}`,
   });
-  const res = await pwFetch(`${SSE_MARGIN}?${params}`, { headers: { Referer: 'https://www.sse.com.cn/', 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } });
+  const res = await pwFetch(`${SSE_MARGIN}?${params}`, { headers: { Referer: 'https://www.sse.com.cn/', 'User-Agent': 'Mozilla/5.0 (pipeworx.io)' } }, MARGIN_FETCH_MS);
   if (!res.ok) throw await httpError(res, 'SSE');
   const body = (await res.json()) as { pageHelp?: { data?: SseMarginRow[] } };
   return body.pageHelp?.data ?? [];
@@ -1841,86 +1898,154 @@ async function marginFinancing(args: Record<string, unknown>) {
     };
   }
 
-  // Market-wide aggregate: SSE's own list is already sorted newest-first with
-  // no date param, so just pull 3 rows for latest + day-over-day change. SZSE
-  // needs an explicit date and fails CLOSED on an unpublished one (empty data,
-  // not an error), so walk back from today.
-  const sseRows = await fetchSseMarginRows(3);
-  if (sseRows.length === 0) throw new Error('SSE margin endpoint returned no rows at all — treat as an upstream failure, not "no margin trading today".');
-  const sse = sseRows[0];
-  const ssePrior = sseRows[1] ?? null;
-  const sseDateIso = ymdToIso(sse.opDate) ?? isoToday();
+  // Market-wide aggregate. Each exchange's own endpoint is the preferred
+  // source and Eastmoney's per-exchange history fills whichever leg does not
+  // answer (see fetchEmMarginRows). Everything runs in parallel under
+  // MARGIN_FETCH_MS. The old path did one SSE call and then walked SZSE back a
+  // day at a time, serially, twice — after the 10-01..10-08 closure that was
+  // up to 24 calls, it overran the gateway's 20s budget, and from 2026-10-09
+  // the tool answered nobody (fleet #2831).
+  //
+  // Both exchanges are reported for the SAME trading day. SSE usually
+  // publishes before SZSE, and the old path summed SSE's newest day with
+  // SZSE's previous one and called it the market total.
+  const requested = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, isoToday()) : null;
+  const dateCap = requested ?? isoToday();
+  const [sseRes, emRes] = await Promise.allSettled([fetchSseMarginRows(10, dateCap), fetchEmMarginRows(15, dateCap)]);
+  const sseOfficial = sseRes.status === 'fulfilled' ? sseRes.value : [];
+  const em = emRes.status === 'fulfilled' ? emRes.value : [];
 
-  const szseLatest = await szseMarginLatest(sseDateIso);
-  const szsePrior = szseLatest.date ? await szseMarginLatest(isoMinusDays(szseLatest.date, 1)) : null;
+  type MarginLeg = {
+    financing: number; lending: number; combined: number;
+    financingBuy: number | null; financingRepay: number | null;
+    lendingShares: number | null; lendingSelloutShares: number | null;
+    source: 'exchange' | 'eastmoney';
+  };
+  const sseByDate = new Map<string, MarginLeg>();
+  for (const r of sseOfficial) {
+    const d = ymdToIso(r.opDate);
+    const f = num(r.rzye);
+    if (!d || f == null || d > dateCap) continue;
+    const l = num(r.rqylje) ?? 0;
+    sseByDate.set(d, { financing: f, lending: l, combined: num(r.rzrqjyzl) ?? f + l, financingBuy: num(r.rzmre), financingRepay: num(r.rzche), lendingShares: num(r.rqyl), lendingSelloutShares: num(r.rqmcl), source: 'exchange' });
+  }
+  const szseFromEm = new Map<string, MarginLeg>();
+  for (const r of em) {
+    const d = String(r.DIM_DATE ?? '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d > dateCap) continue;
+    const hf = num(r.H_RZYE);
+    if (hf != null && !sseByDate.has(d)) {
+      const l = num(r.H_RQYE) ?? 0;
+      sseByDate.set(d, { financing: hf, lending: l, combined: num(r.H_RZRQYE) ?? hf + l, financingBuy: num(r.H_RZMRE), financingRepay: null, lendingShares: num(r.H_RQYL), lendingSelloutShares: num(r.H_RQMCL), source: 'eastmoney' });
+    }
+    const sf = num(r.S_RZYE);
+    if (sf != null) {
+      const l = num(r.S_RQYE) ?? 0;
+      szseFromEm.set(d, { financing: sf, lending: l, combined: num(r.S_RZRQYE) ?? sf + l, financingBuy: num(r.S_RZMRE), financingRepay: null, lendingShares: num(r.S_RQYL), lendingSelloutShares: num(r.S_RQMCL), source: 'eastmoney' });
+    }
+  }
+  if (sseByDate.size === 0) {
+    const why = [sseRes, emRes].map((r, i) => `${i ? 'Eastmoney' : 'SSE'}: ${r.status === 'rejected' ? String((r.reason as Error)?.message ?? r.reason) : 'no rows'}`).join('; ');
+    throw new Error(`Neither SSE nor Eastmoney returned any SSE margin rows on or before ${dateCap} — an upstream failure, not "no margin trading" (${why}).`);
+  }
 
-  const sseFinancing = num(sse.rzye) ?? 0;
-  const sseLending = num(sse.rqylje) ?? 0;
-  const sseCombined = num(sse.rzrqjyzl) ?? (sseFinancing + sseLending);
-  const ssePriorFinancing = ssePrior ? num(ssePrior.rzye) ?? null : null;
-  const ssePriorCombined = ssePrior ? num(ssePrior.rzrqjyzl) ?? null : null;
+  const szseOfficialLeg = async (d: string): Promise<MarginLeg | null> => {
+    const r = await fetchSzseMarginTotal(d);
+    if (!r.found || !r.row) return null;
+    const f = (cnNum(r.row.jrrzye) ?? 0) * 1e8;
+    const l = (cnNum(r.row.jrrjye) ?? 0) * 1e8; // tab1 IS 亿元 — different from tab2 above.
+    const lsh = cnNum(r.row.jrrjyl);
+    const lso = cnNum(r.row.jrrjmc);
+    return { financing: f, lending: l, combined: (cnNum(r.row.jrrzrjye) ?? 0) * 1e8, financingBuy: (cnNum(r.row.jrrzmr) ?? 0) * 1e8, financingRepay: null, lendingShares: lsh != null ? lsh * 1e8 : null, lendingSelloutShares: lso != null ? lso * 1e8 : null, source: 'exchange' };
+  };
 
-  const szseRow = szseLatest.row;
-  const szseFinancing = szseRow ? (cnNum(szseRow.jrrzye) ?? 0) * 1e8 : null;
-  const szseLending = szseRow ? (cnNum(szseRow.jrrjye) ?? 0) * 1e8 : null; // tab1 IS 亿元 — different from tab2 above.
-  const szseCombined = szseRow ? (cnNum(szseRow.jrrzrjye) ?? 0) * 1e8 : null;
-  const szsePriorFinancing = szsePrior?.row ? (cnNum(szsePrior.row.jrrzye) ?? 0) * 1e8 : null;
-  const szsePriorCombined = szsePrior?.row ? (cnNum(szsePrior.row.jrrzrjye) ?? 0) * 1e8 : null;
+  // Trading days SSE has published, newest first. With Eastmoney up, it also
+  // says which of them SZSE has published, so SZSE is fetched for exactly two
+  // dates; without it, the three newest SSE days are tried and the newest SZSE
+  // answer wins.
+  const sseDates = [...sseByDate.keys()].sort().reverse();
+  const candidates = szseFromEm.size > 0 ? sseDates.filter((d) => szseFromEm.has(d)).slice(0, 2) : sseDates.slice(0, 3);
+  const official = await Promise.allSettled(candidates.map(szseOfficialLeg));
+  const aligned: Array<{ date: string; sse: MarginLeg; szse: MarginLeg }> = [];
+  candidates.forEach((d, i) => {
+    const o = official[i];
+    const szse = (o.status === 'fulfilled' ? o.value : null) ?? szseFromEm.get(d) ?? null;
+    if (szse) aligned.push({ date: d, sse: sseByDate.get(d)!, szse });
+  });
+  const cur = aligned[0] ?? null;
+  const prev = aligned[1] ?? null;
 
-  const datesMatch = szseLatest.date === sseDateIso;
+  const sseLatest = sseDates[0];
+  const asOf = cur?.date ?? sseLatest;
+  const sseLeg = sseByDate.get(asOf)!;
+  const ssePrevDate = sseDates[sseDates.indexOf(asOf) + 1] ?? null;
+  const ssePrevLeg = cur ? prev?.sse ?? null : ssePrevDate ? sseByDate.get(ssePrevDate)! : null;
 
-  const marketFinancing = szseFinancing != null ? sseFinancing + szseFinancing : null;
-  const marketCombined = szseCombined != null ? sseCombined + szseCombined : null;
-  const marketFinancingPrior = ssePriorFinancing != null && szsePriorFinancing != null ? ssePriorFinancing + szsePriorFinancing : null;
-  const marketCombinedPrior = ssePriorCombined != null && szsePriorCombined != null ? ssePriorCombined + szsePriorCombined : null;
+  const notes: string[] = [];
+  if (requested && asOf !== requested) notes.push(`Nothing was published for ${requested} (a non-trading day, or not out yet — margin data is T+1), so this is the last trading day on or before it with figures from both exchanges.`);
+  if (cur && sseLatest !== asOf) notes.push(`SSE has published ${sseLatest} but SZSE has not yet, so both exchanges and the market total are shown for ${asOf}, the latest day both have published.`);
+  if (!cur) notes.push(`No SZSE margin total could be fetched for any of ${candidates.join(', ') || 'the recent SSE trading days'}; only the SSE leg is shown and the market-wide total is unavailable.`);
+  if (cur && !prev) notes.push('The prior aligned trading day could not be fetched, so market-wide day-over-day changes are null.');
+  const fromEm = [sseLeg.source === 'eastmoney' ? 'SSE' : null, cur?.szse.source === 'eastmoney' ? 'SZSE' : null].filter(Boolean);
+  if (fromEm.length) notes.push(`The ${fromEm.join(' and ')} figure${fromEm.length > 1 ? 's come' : ' comes'} from Eastmoney's per-exchange margin history because the exchange's own endpoint did not answer; the two have matched to the yuan wherever both were checked.`);
+
+  const dod = (a: number | null | undefined, b: number | null | undefined) => (a != null && b != null ? Math.round(a - b) : null);
+  const marketFinancing = cur ? cur.sse.financing + cur.szse.financing : null;
+  const marketCombined = cur ? cur.sse.combined + cur.szse.combined : null;
+  const marketFinancingPrior = prev ? prev.sse.financing + prev.szse.financing : null;
+  const marketCombinedPrior = prev ? prev.sse.combined + prev.szse.combined : null;
+  const srcLabel = (l: MarginLeg, exchange: string) => (l.source === 'exchange' ? exchange : 'Eastmoney datacenter RPTA_RZRQ_LSDB (fallback)');
 
   return {
     country: 'China',
     market: 'China A-share market (SSE + SZSE)',
-    as_of: sseDateIso,
-    date_note: datesMatch
-      ? null
-      : `SSE's latest published margin date is ${sseDateIso} but SZSE's latest is ${szseLatest.date ?? 'not found in the last 12 days'} — the two figures below are NOT for the same trading day; treat market-wide totals as unavailable until they align.`,
+    as_of: asOf,
+    prior_date: cur ? prev?.date ?? null : ssePrevDate,
+    date_note: notes.length ? notes.join(' ') : null,
     statement:
-      `China A-share market margin financing (融资融券余额) as of ${sseDateIso}: SSE financing balance ¥${sseFinancing.toLocaleString()}, ` +
-      (szseFinancing != null ? `SZSE financing balance ¥${szseFinancing.toLocaleString()} (as of ${szseLatest.date}), combined ¥${(marketFinancing ?? 0).toLocaleString()}.` : 'SZSE figure unavailable.'),
+      `China A-share market margin financing (融资融券余额) as of ${asOf}: SSE financing balance ¥${sseLeg.financing.toLocaleString()}, ` +
+      (cur ? `SZSE financing balance ¥${cur.szse.financing.toLocaleString()}, combined ¥${(marketFinancing ?? 0).toLocaleString()}` +
+        (marketFinancingPrior != null && prev ? ` (${marketFinancing! - marketFinancingPrior >= 0 ? '+' : ''}¥${Math.round(marketFinancing! - marketFinancingPrior).toLocaleString()} vs ${prev.date}).` : '.')
+        : 'SZSE figure unavailable.'),
     exchanges: {
       sse: {
-        date: sseDateIso,
-        financing_balance_cny: sseFinancing,
-        financing_buy_cny: num(sse.rzmre),
-        financing_repay_cny: num(sse.rzche),
-        lending_balance_cny: sseLending,
-        lending_balance_shares: num(sse.rqyl),
-        lending_sellout_shares: num(sse.rqmcl),
-        combined_balance_cny: sseCombined,
-        change_financing_cny_dod: ssePriorFinancing != null ? Math.round(sseFinancing - ssePriorFinancing) : null,
-        change_combined_cny_dod: ssePriorCombined != null ? Math.round(sseCombined - ssePriorCombined) : null,
+        date: asOf,
+        financing_balance_cny: sseLeg.financing,
+        financing_buy_cny: sseLeg.financingBuy,
+        financing_repay_cny: sseLeg.financingRepay,
+        lending_balance_cny: sseLeg.lending,
+        lending_balance_shares: sseLeg.lendingShares,
+        lending_sellout_shares: sseLeg.lendingSelloutShares,
+        combined_balance_cny: sseLeg.combined,
+        change_financing_cny_dod: dod(sseLeg.financing, ssePrevLeg?.financing),
+        change_combined_cny_dod: dod(sseLeg.combined, ssePrevLeg?.combined),
+        source: srcLabel(sseLeg, 'SSE query.sse.com.cn queryMargin.do'),
       },
-      szse: szseRow
+      szse: cur
         ? {
-            date: szseLatest.date,
-            financing_balance_cny: szseFinancing,
-            financing_buy_cny: (cnNum(szseRow.jrrzmr) ?? 0) * 1e8,
-            lending_balance_cny: szseLending,
-            lending_balance_100m_shares: cnNum(szseRow.jrrjyl),
-            lending_sellout_100m_shares: cnNum(szseRow.jrrjmc),
-            combined_balance_cny: szseCombined,
-            change_financing_cny_dod: szsePriorFinancing != null && szseFinancing != null ? Math.round(szseFinancing - szsePriorFinancing) : null,
-            change_combined_cny_dod: szsePriorCombined != null && szseCombined != null ? Math.round(szseCombined - szsePriorCombined) : null,
+            date: asOf,
+            financing_balance_cny: cur.szse.financing,
+            financing_buy_cny: cur.szse.financingBuy,
+            lending_balance_cny: cur.szse.lending,
+            lending_balance_100m_shares: cur.szse.lendingShares != null ? Math.round(cur.szse.lendingShares / 1e6) / 100 : null,
+            lending_sellout_100m_shares: cur.szse.lendingSelloutShares != null ? Math.round(cur.szse.lendingSelloutShares / 1e6) / 100 : null,
+            combined_balance_cny: cur.szse.combined,
+            change_financing_cny_dod: dod(cur.szse.financing, prev?.szse.financing),
+            change_combined_cny_dod: dod(cur.szse.combined, prev?.szse.combined),
+            source: srcLabel(cur.szse, 'SZSE www.szse.cn ShowReport 1837_xxpl tab1'),
           }
-        : { found: false, message: `No SZSE margin total published in the 12 calendar days up to ${sseDateIso}.` },
+        : { found: false, message: `No SZSE margin total could be fetched for ${candidates.join(', ') || 'any recent SSE trading day'}.` },
     },
     market_wide: {
       financing_balance_cny: marketFinancing,
       combined_margin_balance_cny: marketCombined,
-      change_financing_cny_dod: marketFinancingPrior != null && marketFinancing != null ? Math.round(marketFinancing - marketFinancingPrior) : null,
-      change_combined_cny_dod: marketCombinedPrior != null && marketCombined != null ? Math.round(marketCombined - marketCombinedPrior) : null,
-      unavailable_reason: marketFinancing == null ? 'SZSE figure for this date could not be found.' : null,
+      change_financing_cny_dod: dod(marketFinancing, marketFinancingPrior),
+      change_combined_cny_dod: dod(marketCombined, marketCombinedPrior),
+      unavailable_reason: marketFinancing == null ? 'SZSE figure for this date could not be fetched.' : null,
     },
     note:
-      'financing_balance_cny = 融资余额 (money borrowed to buy stock); lending_balance_cny = 融券余额 (value of shares borrowed to short); combined_balance_cny = 融资融券余额. Margin data publishes T+1, so a weekday morning request often resolves to yesterday\'s figures. SSE fields are native CNY (元); SZSE tab1 fields are native 亿元, converted here ×1e8 — do not reuse that factor for ashares_margin_financing({symbol}), whose SZSE per-stock source (tab2) reports 融券余额 in 万元 (×1e4) instead.',
-    source: 'SSE query.sse.com.cn/marketdata/tradedata/queryMargin.do (keyless) + SZSE www.szse.cn ShowReport CATALOGID=1837_xxpl tab1 (keyless)',
+      'financing_balance_cny = 融资余额 (money borrowed to buy stock); lending_balance_cny = 融券余额 (value of shares borrowed to short); combined_balance_cny = 融资融券余额. Margin data publishes T+1 and SSE usually publishes before SZSE, so a morning request often resolves to an earlier day than the newest SSE figure. Market totals cover SSE + SZSE (the Beijing exchange is excluded; it is under 0.5% of the total). SSE fields are native CNY (元); SZSE tab1 fields are native 亿元, converted here ×1e8 — do not reuse that factor for ashares_margin_financing({symbol}), whose SZSE per-stock source (tab2) reports 融券余额 in 万元 (×1e4) instead.',
+    source: 'SSE query.sse.com.cn/marketdata/tradedata/queryMargin.do (keyless) + SZSE www.szse.cn ShowReport CATALOGID=1837_xxpl tab1 (keyless); Eastmoney datacenter RPTA_RZRQ_LSDB per-exchange history as fallback (keyless)',
   };
 }
 
