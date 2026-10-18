@@ -689,6 +689,21 @@ function collapse(s: string): string {
  *    (both keyless). Added 2026-10-08 (fleet #2831) — the #1 demand-read gap
  *    (42 distinct callers, 14d) at the time this was built.
  *
+ *  - Industry-SECTOR net capital inflow RANKING (行业资金流向排名), one row per
+ *    Eastmoney industry board (128 boards on a recent trading day) with
+ *    main-capital net inflow broken down by order size, change %, and each
+ *    sector's top net-inflow stock. Source: Eastmoney datacenter-web
+ *    RPT_INDUSTRY_FUNDFLOW (keyless) — the SAME host/helper this file already
+ *    uses for ashares_billboard/earnings, not the push2/push2his `clist`
+ *    ranking endpoint (confirmed blocked from non-China egress, fleet #3242:
+ *    every push2*.eastmoney.com/api/qt/clist/get probe — plain, numbered
+ *    load-balancer hosts, with/without `ut` token — either 502s immediately
+ *    or resets the TLS connection, while push2his's OWN fflow/daykline and
+ *    datacenter-web's RPT_* reports answer normally). Added 2026-10-17 (fleet
+ *    #3242) to fill the gap between ashares_capital_flow (per-stock only) and
+ *    china-exchange-data's ashares_sector_flows (SZSE's own official
+ *    per-industry TURNOVER ranking, not net inflow).
+ *
  * Note: both upstreams are China-hosted; verified reachable, but see egress notes.
  */
 
@@ -774,6 +789,12 @@ const BILLBOARD_ORG_REPORT = 'RPT_ORGANIZATION_TRADE_DETAILSNEW';
 // closest keyless "top brokerages" signal for a 龙虎榜 date; also recovered
 // from lhb.html (hyyyb widget). Verified live 2026-10-08.
 const BILLBOARD_BRANCH_REPORT = 'RPT_OPERATEDEPT_ACTIVE';
+// Industry-sector net capital inflow ranking (行业资金流向), same
+// datacenter-web host + dcQuery() helper as the three reports above, just a
+// different reportName. Verified live 2026-10-17 (fleet #3242): 128 industry
+// boards for 2026-10-16, NET_INFLOW already in raw CNY (¥62.3bn for
+// 半导体/BK1036 on a hot day -- not 万元/亿元, no unit conversion needed).
+const INDUSTRY_FUNDFLOW_REPORT = 'RPT_INDUSTRY_FUNDFLOW';
 // Bulk per-day, per-stock valuation snapshot (ALL ~5,500+ A-shares in one
 // paged report) — the one genuinely historical bulk Eastmoney report found
 // for a PAST date: price, change %, market cap, and industry/板块
@@ -1095,6 +1116,21 @@ const tools: McpToolExport['tools'] = [
       required: ['codes', 'start'],
     },
   },
+  {
+    name: 'ashares_sector_capital_flow',
+    description:
+      "China A-share INDUSTRY-SECTOR net capital inflow ranking (行业资金流向排名/板块资金流) for a trading day -- ranks Eastmoney's ~128 industry boards (行业板块) by main-capital net inflow (主力净流入), with the breakdown by order size (超大单/大单/中单/小单 net inflow in CNY), the day's change %, and each sector's single stock with the largest net inflow. Answers '今日行业资金流向排名', 'which industry sectors had the biggest net capital inflow today', '板块资金流排名', 'sector fund flow ranking', 'semiconductor sector money flow today'. This is a DIFFERENT metric from china-exchange-data's ashares_sector_flows, which is SZSE's own official per-industry TURNOVER ranking -- this tool is Eastmoney's vendor-computed NET INFLOW (主力净流入) classification, the sector-level counterpart to this pack's own per-stock ashares_capital_flow. A non-trading date (weekend/holiday, or before today's session has published -- publication usually lags a day) walks back automatically to the nearest prior trading day with data. Source: Eastmoney datacenter (keyless).",
+    summary: 'China A-share industry sectors ranked by main-capital net inflow for a trading day, from Eastmoney.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        date: { type: 'string', description: "Trading day as YYYY-MM-DD or YYYYMMDD (default: most recent day with published data -- today's session often has not published yet)." },
+        limit: { type: 'number', description: 'How many sectors to return, 1-130 (default 20).' },
+        sort: { type: 'string', enum: ['net_inflow', 'net_inflow_ratio', 'change_pct'], description: "Rank by net inflow amount in CNY (主力净流入, default), net inflow as a % of turnover (净流入占比), or the day's change % (涨跌幅)." },
+        order: { type: 'string', enum: ['desc', 'asc'], description: 'desc (default, biggest net inflow first) or asc (biggest net outflow first).' },
+      },
+    },
+  },
 ];
 
 // ── handlers ─────────────────────────────────────────────────────────
@@ -1337,6 +1373,78 @@ async function historicalChangeRanking(dateIso: string, ascFlag: '0' | '1', maxT
     cursor = isoMinusDays(cursor, 1);
   }
   return { date: dateIso, rows: [] };
+}
+
+// ── ashares_sector_capital_flow ─────────────────────────────────────────
+const SECTOR_SORT_COLUMNS = { net_inflow: 'NET_INFLOW', net_inflow_ratio: 'NET_INFLOW_RATIO', change_pct: 'CHANGE_RATE' } as const;
+type SectorSortKey = keyof typeof SECTOR_SORT_COLUMNS;
+
+async function fetchSectorFundFlow(dateIso: string, sortColumn: string, ascFlag: '0' | '1'): Promise<Array<Record<string, unknown>>> {
+  return dcQuery({
+    reportName: INDUSTRY_FUNDFLOW_REPORT,
+    filter: `(TRADE_DATE='${dateIso}')`,
+    sortColumns: sortColumn,
+    sortTypes: ascFlag === '1' ? '1' : '-1',
+    pageSize: '200',
+    pageNumber: '1',
+  });
+}
+
+async function sectorCapitalFlow(args: Record<string, unknown>) {
+  const want = Math.min(Math.max(Number(args.limit ?? 20), 1), 130);
+  const sortArg = typeof args.sort === 'string' ? args.sort.trim().toLowerCase() : 'net_inflow';
+  const sortKey: SectorSortKey = (['net_inflow', 'net_inflow_ratio', 'change_pct'] as const).includes(sortArg as SectorSortKey)
+    ? (sortArg as SectorSortKey)
+    : 'net_inflow';
+  const sortColumn = SECTOR_SORT_COLUMNS[sortKey];
+  const orderArg = typeof args.order === 'string' ? args.order.trim().toLowerCase() : 'desc';
+  const asc = orderArg === 'asc' ? '1' : '0';
+
+  const todayIso = isoToday();
+  const startIso = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, todayIso) : todayIso;
+
+  let cursor = startIso;
+  let rows: Array<Record<string, unknown>> = [];
+  let resolvedDate = cursor;
+  let tried = 0;
+  for (; tried < 8; tried++) {
+    rows = await fetchSectorFundFlow(cursor, sortColumn, asc as '0' | '1');
+    if (rows.length > 0) { resolvedDate = cursor; break; }
+    cursor = isoMinusDays(cursor, 1);
+  }
+  if (rows.length === 0) {
+    return {
+      date: startIso,
+      found: false,
+      message: `No industry-sector net-inflow data found for ${startIso} or the ${tried} trading day(s) before it (weekend/holiday run, today's session not yet published, or a date too far in the future).`,
+    };
+  }
+
+  const sectors = rows.slice(0, want).map((r) => ({
+    board_code: r.BOARD_CODE ?? null,
+    industry: r.BOARD_NAME ?? null,
+    change_pct: num(r.CHANGE_RATE) != null ? Math.round((num(r.CHANGE_RATE) as number) * 100) / 100 : null,
+    net_inflow_cny: num(r.NET_INFLOW),
+    net_inflow_ratio_pct: num(r.NET_INFLOW_RATIO) != null ? Math.round((num(r.NET_INFLOW_RATIO) as number) * 100) / 100 : null,
+    super_large_net_inflow_cny: num(r.SUPERDEAL_NET),
+    large_net_inflow_cny: num(r.BIGDEAL_NET),
+    medium_net_inflow_cny: num(r.MIDDEAL_NET),
+    small_net_inflow_cny: num(r.SMALLDEAL_NET),
+    top_net_inflow_stock: r.MAX_NETINFLOW_SEC ?? null,
+  }));
+
+  return {
+    date: resolvedDate,
+    date_note: resolvedDate === startIso ? null : `${startIso} had no published sector net-inflow data (weekend/holiday, or today's session not yet published); walked back to the nearest prior trading day, ${resolvedDate}.`,
+    data_as_of: resolvedDate,
+    sort: sortKey,
+    order: asc === '1' ? 'asc' : 'desc',
+    total_sectors: rows.length,
+    returned: sectors.length,
+    note: "net_inflow_cny (主力净流入) = super_large + large net inflow (超大单+大单), Eastmoney's own order-size classification -- the sector-level counterpart to this pack's ashares_capital_flow (per-stock). This ranks by net INFLOW, not turnover; for the exchange's own official per-industry turnover ranking see china-exchange-data's ashares_sector_flows.",
+    source: 'Eastmoney datacenter-web RPT_INDUSTRY_FUNDFLOW (keyless)',
+    sectors,
+  };
 }
 
 function boardMatches(code: string, board: 'hs_a' | 'sh_a' | 'sz_a' | 'cyb'): boolean {
@@ -2572,6 +2680,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return intradayBars(args);
     case 'ashares_technical_indicators':
       return technicalIndicators(args);
+    case 'ashares_sector_capital_flow':
+      return sectorCapitalFlow(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
