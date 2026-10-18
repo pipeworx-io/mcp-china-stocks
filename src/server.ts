@@ -10,7 +10,7 @@ import pack from './index.js';
 
 
 const server = new Server(
-  { name: '@pipeworx/mcp-china-stocks', version: '0.1.10' },
+  { name: '@pipeworx/mcp-china-stocks', version: '0.1.11' },
   { capabilities: { tools: {} } },
 );
 

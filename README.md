@@ -2,7 +2,7 @@
 
 Live data for the Chinese A-share market (Shanghai / Shenzhen / STAR / ChiNext) — real-time quotes, intraday minute bars, daily OHLCV history, technical indicators, the limit-up/limit-down boards, market-wide margin financing balance, market-wide turnover ranking, and company earnings guidance/analyst consensus.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1837+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -16,6 +16,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `ashares_turnover_ranking({ limit?, sort?, order?, board? })` — market-wide ranking by turnover amount, change %, or volume, server-side sorted, with turnover in CNY.
 - `ashares_earnings_forecast({ symbol, limit? })` — company-issued earnings guidance (业绩预告): predicted profit range, YoY change %, forecast type, stated reason.
 - `ashares_analyst_consensus({ symbol })` — analyst consensus estimates (盈利预测) per forecast year: EPS, PE, net profit, revenue.
+- `ashares_stock_connect({ date? })` — Stock Connect (沪深港通) daily channel turnover: Northbound (mainland A-shares bought via Hong Kong — 沪股通/深股通/combined) and Southbound (HK-listed stocks bought by mainland investors — 港股通沪/港股通深/combined), in CNY. Mainland regulators (CSRC) stopped publishing DAILY net fund-flow figures for Northbound in August 2024 — every Northbound channel's `net_flow` says so explicitly rather than returning nulls as if they were real data; gross turnover remains published for every channel. Also attempts a per-stock "top traded stocks" ranking for Northbound on every call (`top_traded_stocks.northbound`) and reports plainly whether real data came back — as of this build, Eastmoney's upstream report for that ranking returns a server error on every probe, so it currently reports "not available" rather than faking rows.
 
 ## Auth
 
@@ -82,7 +83,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1831+ data sources. The
+Both URLs reach the same gateway and the same 1837+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

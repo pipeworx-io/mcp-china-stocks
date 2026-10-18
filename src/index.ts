@@ -704,6 +704,14 @@ function collapse(s: string): string {
  *    china-exchange-data's ashares_sector_flows (SZSE's own official
  *    per-industry TURNOVER ranking, not net inflow).
  *
+ *  - STOCK CONNECT (沪深港通) daily channel turnover — Northbound (A-shares
+ *    bought via HK) and Southbound (HK stocks bought via the mainland), plus
+ *    a best-effort Northbound top-traded-stocks list. Source: Eastmoney
+ *    datacenter-web RPT_MUTUAL_DEAL_HISTORY (keyless). Added 2026-10-18
+ *    (fleet #3299): Northbound's net fund-flow fields come back null because
+ *    CSRC stopped daily net-flow disclosure in August 2024 — the tool says so
+ *    explicitly rather than returning the nulls as if they were data.
+ *
  * Note: both upstreams are China-hosted; verified reachable, but see egress notes.
  */
 
@@ -795,6 +803,164 @@ const BILLBOARD_BRANCH_REPORT = 'RPT_OPERATEDEPT_ACTIVE';
 // boards for 2026-10-16, NET_INFLOW already in raw CNY (¥62.3bn for
 // 半导体/BK1036 on a hot day -- not 万元/亿元, no unit conversion needed).
 const INDUSTRY_FUNDFLOW_REPORT = 'RPT_INDUSTRY_FUNDFLOW';
+// Stock Connect (沪深港通) daily channel statistics -- Northbound (mainland
+// A-shares bought via HK: 沪股通/深股通/combined) and Southbound (HK stocks
+// bought via the mainland: 港股通沪/港股通深/combined). Same datacenter-web
+// host + dcQuery() helper. Added 2026-10-18 (fleet #3299). Verified live:
+// mainland regulators stopped PUBLISHING daily net fund-flow figures for
+// Northbound in August 2024 -- FUND_INFLOW/NET_DEAL_AMT/QUOTA_BALANCE/
+// BUY_AMT/SELL_AMT come back `null` for every Northbound row (MUTUAL_TYPE
+// 001/003/005) on every recent date probed, while the SAME fields are still
+// populated for Southbound (002/004/006, disclosed by HKEX, not CSRC) --
+// confirmed BUY_AMT+SELL_AMT==DEAL_AMT exactly for a Southbound row. Gross
+// turnover (DEAL_AMT) remains published for every channel, every date.
+const STOCK_CONNECT_REPORT = 'RPT_MUTUAL_DEAL_HISTORY';
+// Eastmoney's per-stock Northbound daily statistics report -- this is where a
+// turnover-ranked "top traded stocks" list for Northbound would live. Probed
+// live repeatedly 2026-10-18 with every param shape akshare's own (actively
+// maintained) client uses: every call returns {success:false, code:9701,
+// message:"服务器繁忙"} -- a genuine upstream error (report CONFIG exists --
+// an invalid reportName gets a different code, 9501, "报表配置不存在" -- this
+// one just never answers). akshare's current source (fetched live the same
+// day) has no replacement function either. Left wired up rather than removed:
+// if it recovers (this probe was not from the gateway's own egress), the tool
+// should start serving real data with no further change; until then it must
+// degrade to an explicit "not available" rather than retry forever or fake rows.
+const STOCK_CONNECT_NORTH_STOCK_REPORT = 'RPT_MUTUAL_STOCK_NORTHSTA';
+
+const CONNECT_CHANNELS: Array<{ code: string; key: string; label: string; direction: 'northbound' | 'southbound' }> = [
+  { code: '005', key: 'northbound_combined', label: 'Northbound combined (北向资金) -- mainland A-shares bought via both Shanghai and Shenzhen legs', direction: 'northbound' },
+  { code: '001', key: 'northbound_shanghai', label: 'Shanghai-Hong Kong Stock Connect, Northbound leg (沪股通)', direction: 'northbound' },
+  { code: '003', key: 'northbound_shenzhen', label: 'Shenzhen-Hong Kong Stock Connect, Northbound leg (深股通)', direction: 'northbound' },
+  { code: '006', key: 'southbound_combined', label: 'Southbound combined (南向资金) -- HK-listed stocks bought by mainland investors via both legs', direction: 'southbound' },
+  { code: '002', key: 'southbound_via_shanghai', label: 'Southbound leg via Shanghai (港股通沪)', direction: 'southbound' },
+  { code: '004', key: 'southbound_via_shenzhen', label: 'Southbound leg via Shenzhen (港股通深)', direction: 'southbound' },
+];
+
+const NET_FLOW_NOT_PUBLISHED_NOTE =
+  'Net fund flow for this channel (net buy/sell amount, daily inflow, remaining quota) is NOT PUBLISHED as of this date. Mainland regulators (CSRC) stopped the DAILY net-flow disclosure for Northbound Stock Connect in August 2024 -- this is a real discontinuation, not a missing field or a fetch failure. Gross turnover (turnover_cny above) remains published daily for every channel, Northbound included. Southbound (Hong Kong-bound) net flow is still disclosed by HKEX and appears under net_flow when available.';
+
+/** Eastmoney publishes these fields in units of million CNY (verified: a
+ * Southbound row's BUY_AMT + SELL_AMT == DEAL_AMT exactly at that scale).
+ * Converts to absolute CNY so callers never have to guess a 万/亿 multiplier. */
+function millionCnyToCny(v: unknown): number | null {
+  const n = num(v);
+  return n == null ? null : Math.round(n * 1e6);
+}
+
+/** Best-effort per-stock Northbound turnover ranking -- see
+ * STOCK_CONNECT_NORTH_STOCK_REPORT's comment: this upstream report has
+ * returned a server error on every live probe to date. Never silently
+ * returns an empty "stocks: []" as if that meant zero activity -- always
+ * says plainly whether real data came back. */
+async function topTradedStocksNorthbound(dateIso: string): Promise<{ available: boolean; note: string; stocks?: Array<Record<string, unknown>> }> {
+  try {
+    const rows = await dcQuery({
+      reportName: STOCK_CONNECT_NORTH_STOCK_REPORT,
+      filter: `(INTERVAL_TYPE="1")(MUTUAL_TYPE in ("001","003"))(TRADE_DATE='${dateIso}')`,
+      sortColumns: 'TRADE_DATE',
+      sortTypes: '-1',
+      pageSize: '10',
+      pageNumber: '1',
+    });
+    if (rows.length === 0) {
+      return { available: false, note: `Eastmoney's per-stock Northbound Stock Connect statistics report returned no rows for ${dateIso} (not an error -- a genuine empty result).` };
+    }
+    const stocks = rows.slice(0, 10).map((r) => ({
+      code: r.SECURITY_CODE ?? null,
+      name: r.SECURITY_NAME ?? null,
+      close_price: num(r.CLOSE_PRICE),
+      change_pct: num(r.CHANGE_RATE) != null ? Math.round((num(r.CHANGE_RATE) as number) * 100) / 100 : null,
+    }));
+    return { available: true, note: "Ranked as returned by Eastmoney's Northbound per-stock daily statistics report.", stocks };
+  } catch (e) {
+    return {
+      available: false,
+      note: `A per-stock "top traded stocks" ranking for Northbound Stock Connect is NOT currently available -- Eastmoney's datacenter report for this (reportName=${STOCK_CONNECT_NORTH_STOCK_REPORT}) returned an error rather than data on this request (${e instanceof Error ? e.message : 'unknown error'}). This may be the same 2024 regulatory change that stopped daily Northbound net-flow publication, or a transient/retired upstream report -- either way, this is a real "not available", not a null standing in for zero. Channel-level gross turnover above is unaffected and remains published.`,
+    };
+  }
+}
+
+async function stockConnect(args: Record<string, unknown>) {
+  const todayIso = isoToday();
+  const startIso = typeof args.date === 'string' && args.date.trim() ? isoDate(args.date, todayIso) : todayIso;
+
+  let cursor = startIso;
+  let rows: Array<Record<string, unknown>> = [];
+  let resolvedDate = cursor;
+  let tried = 0;
+  for (; tried < 8; tried++) {
+    rows = await dcQuery({
+      reportName: STOCK_CONNECT_REPORT,
+      filter: `(TRADE_DATE='${cursor}')`,
+      sortColumns: 'MUTUAL_TYPE',
+      sortTypes: '1',
+      pageSize: '10',
+      pageNumber: '1',
+    });
+    if (rows.length > 0) { resolvedDate = cursor; break; }
+    cursor = isoMinusDays(cursor, 1);
+  }
+  if (rows.length === 0) {
+    return {
+      date: startIso,
+      found: false,
+      message: `No Stock Connect data found for ${startIso} or the ${tried} trading day(s) before it (weekend/holiday run, or today's session not yet published).`,
+    };
+  }
+
+  const byType = new Map<string, Record<string, unknown>>();
+  for (const r of rows) byType.set(String(r.MUTUAL_TYPE ?? ''), r);
+
+  const channels = CONNECT_CHANNELS.map((ch) => {
+    const r = byType.get(ch.code);
+    if (!r) return { channel: ch.key, label: ch.label, direction: ch.direction, found: false };
+    const netFlowPublished = r.NET_DEAL_AMT != null || r.FUND_INFLOW != null || r.BUY_AMT != null;
+    return {
+      channel: ch.key,
+      label: ch.label,
+      direction: ch.direction,
+      found: true,
+      turnover_cny: millionCnyToCny(r.DEAL_AMT),
+      deal_count_or_volume: num(r.DEAL_NUM),
+      lead_stock: r.LEAD_STOCKS_CODE
+        ? { code: r.LEAD_STOCKS_CODE ?? null, name: r.LEAD_STOCKS_NAME ?? null, change_pct: num(r.LS_CHANGE_RATE) }
+        : null,
+      net_flow: netFlowPublished
+        ? {
+            published: true,
+            net_buy_cny: millionCnyToCny(r.NET_DEAL_AMT),
+            buy_amount_cny: millionCnyToCny(r.BUY_AMT),
+            sell_amount_cny: millionCnyToCny(r.SELL_AMT),
+            daily_fund_inflow_cny: millionCnyToCny(r.FUND_INFLOW),
+            quota_balance_raw: num(r.QUOTA_BALANCE),
+            quota_balance_text: r.QUOTA_BALANCE_TEXT ?? null,
+            cumulative_net_buy_raw: num(r.ACCUM_DEAL_AMT),
+            unit_note: 'buy/sell/net/inflow are converted to absolute CNY from Eastmoney\'s raw million-CNY figures (verified: buy_amount_cny + sell_amount_cny == turnover_cny). quota_balance_raw and cumulative_net_buy_raw are passed through UNCONVERTED -- their exact unit was not independently verified and should be treated as indicative only; quota_balance_text carries Eastmoney\'s own plain-language reading.',
+          }
+        : { published: false, note: NET_FLOW_NOT_PUBLISHED_NOTE },
+    };
+  });
+
+  const northboundTop = await topTradedStocksNorthbound(resolvedDate).catch((e) => ({
+    available: false as const,
+    note: `top_traded_stocks lookup threw unexpectedly: ${e instanceof Error ? e.message : 'unknown error'}`,
+  }));
+
+  return {
+    date: resolvedDate,
+    date_note: resolvedDate === startIso ? null : `${startIso} had no published Stock Connect data (weekend/holiday, or today's session not yet published); walked back to the nearest prior trading day, ${resolvedDate}.`,
+    data_as_of: resolvedDate,
+    note: 'Northbound = mainland A-shares bought via Hong Kong (沪股通/深股通). Southbound = Hong Kong-listed stocks bought by mainland investors via the same mechanism (港股通). China (CSRC) stopped publishing DAILY net fund-flow figures for Northbound Stock Connect in August 2024 -- see each Northbound channel\'s net_flow.note. Gross turnover remains published daily for every channel.',
+    source: 'Shanghai Stock Exchange / Shenzhen Stock Exchange / Hong Kong Exchanges and Clearing -- Stock Connect daily statistics, via Eastmoney datacenter (keyless)',
+    channels,
+    top_traded_stocks: {
+      northbound: northboundTop,
+      southbound: { available: false, note: 'A per-stock turnover ranking for Southbound Stock Connect was not built in this pass -- only channel-level turnover (above) is currently served for Southbound.' },
+    },
+  };
+}
+
 // Bulk per-day, per-stock valuation snapshot (ALL ~5,500+ A-shares in one
 // paged report) — the one genuinely historical bulk Eastmoney report found
 // for a PAST date: price, change %, market cap, and industry/板块
@@ -1128,6 +1294,18 @@ const tools: McpToolExport['tools'] = [
         limit: { type: 'number', description: 'How many sectors to return, 1-130 (default 20).' },
         sort: { type: 'string', enum: ['net_inflow', 'net_inflow_ratio', 'change_pct'], description: "Rank by net inflow amount in CNY (主力净流入, default), net inflow as a % of turnover (净流入占比), or the day's change % (涨跌幅)." },
         order: { type: 'string', enum: ['desc', 'asc'], description: 'desc (default, biggest net inflow first) or asc (biggest net outflow first).' },
+      },
+    },
+  },
+  {
+    name: 'ashares_stock_connect',
+    description:
+      'Stock Connect (沪深港通) daily channel statistics: GROSS TURNOVER for Northbound (mainland A-shares bought via Hong Kong -- 沪股通/深股通/combined) and Southbound (Hong Kong-listed stocks bought by mainland investors -- 港股通沪/港股通深/combined), plus a best-effort per-stock "top traded stocks" list for Northbound. Answers "northbound stock connect turnover today", "沪深股通成交额", "how much did northbound/southbound trade today", "stock connect top traded stocks". IMPORTANT: mainland regulators (CSRC) stopped publishing DAILY net fund-flow figures (net buy/sell, daily inflow, remaining quota) for NORTHBOUND Stock Connect in August 2024 -- every Northbound channel\'s net_flow field says so explicitly rather than returning null as if it were real data; gross turnover is unaffected and is published daily for every channel. Southbound net flow is still disclosed by Hong Kong Exchanges and Clearing and is returned when available. A turnover-ranked top-10-stocks list for Northbound depends on an Eastmoney report that has returned a server error on every live probe during this build -- the tool still attempts it live on every call and reports plainly under top_traded_stocks.northbound whether real data came back, rather than silently omitting the field or faking rows. Source: Shanghai Stock Exchange / Shenzhen Stock Exchange / Hong Kong Exchanges and Clearing, via Eastmoney datacenter (keyless).',
+    summary: 'China Stock Connect daily Northbound/Southbound turnover, with an explicit note where daily net-flow is no longer published.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        date: { type: 'string', description: 'Trading day as YYYY-MM-DD or YYYYMMDD (default: most recent day with published data -- today\'s session often has not published yet).' },
       },
     },
   },
@@ -2682,6 +2860,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return technicalIndicators(args);
     case 'ashares_sector_capital_flow':
       return sectorCapitalFlow(args);
+    case 'ashares_stock_connect':
+      return stockConnect(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
