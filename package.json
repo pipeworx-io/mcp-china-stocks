@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-china-stocks",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "China A-shares MCP. Keyless.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-a5d37cc4161011c7196b58439a31f914db1d8f794ff2f2109743fbc4b7dcbdb4",
-    "sourceCommit": "0f33463aa47677f38e4f177a4b4a7160dd80819f"
+    "sourceHash": "v1-82a499cb27b9b03a58fdcdbd8861b0e9957b51e7f0a5d7d747f9adb038d5c393",
+    "sourceCommit": "b0a4b8e2f3f5b3a4c3f9f2c9a73f91b20d32ce11"
   }
 }
