@@ -2,7 +2,7 @@
 
 Live data for the Chinese A-share market (Shanghai / Shenzhen / STAR / ChiNext) — real-time quotes, intraday minute bars, daily OHLCV history, technical indicators, the limit-up/limit-down boards, market-wide margin financing balance, market-wide turnover ranking, and company earnings guidance/analyst consensus.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1863+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -10,6 +10,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `ashares_limit_up({ date?, limit? })` — the daily limit-up board (涨停板): how many stocks hit their daily price limit and the ranked pool with consecutive-board count, seal fund, industry, turnover.
 - `ashares_limit_down({ date?, limit? })` — the daily limit-down board (跌停板), the counterpart to `ashares_limit_up`: how many stocks hit their daily down price limit and the ranked pool. Source: Eastmoney `getTopicDTPool` (same host/shape as the limit-up pool).
 - `ashares_margin_financing({ symbol?, date? })` — China A-share margin financing and securities-lending balance (融资融券余额/两融余额): market-wide aggregate by exchange (SSE + SZSE) with day-over-day change when `symbol` is omitted, or one SZSE-listed stock's own balance when `symbol` is a 6-digit SZSE code (0/3/159-prefixed). SSE per-stock detail has no verified keyless route, so an SSE code (6xxxxx) returns a clear `not_available` message rather than guessing. Margin data publishes T+1 and SSE usually publishes before SZSE, so the aggregate reports both exchanges for the latest trading day BOTH have published (on or before `date`), says so in `date_note`, and never sums two different days into one market total.
+- `ashares_capital_flow({ code, days? })` — a stock's daily main-capital (主力) net-inflow history by order size. Every response carries `data_as_of` (latest trading day in the series), `fetched_at` and `stale`. The series is cached per stock: 5 minutes while the A-share session can still move today's row, 24h once it has closed. If Eastmoney refuses or times out, the last good copy (up to 7 days old) is served with `stale: true`; with no copy the call errors.
 - `ashares_quote({ symbols })` — real-time quote(s) by 6-digit code, comma-separated.
 - `ashares_daily_history({ codes, start, end?, adjust? })` — daily OHLCV history (open/high/low/close/volume, day-over-day change %) for up to 20 codes over a date range. `adjust`: `qfq` (forward-adjusted, default), `hfq` (backward-adjusted), or `none` (raw). Turnover amount (成交额) is not exposed by the daily-bar source, so `amount_cny` reports `"not_available"` per row rather than being estimated — use `ashares_quote` or `ashares_turnover_ranking` for same-day turnover amount.
 - `ashares_intraday_bars({ symbols, date, up_to?, interval? })` — intraday minute bars (分时/分钟K线) for a past trading day, up to 5 comma-separated codes, with `cumulative_volume_shares`/`cumulative_turnover_cny` summed from the day's open through `up_to` (e.g. `"11:05"`; omit for the whole day). `interval` is the bar size in minutes (`1`/`5`/`15`/`30`/`60`, default `5`). **Bounded lookback**: the upstream caps total bars at ~1950 regardless of interval, so retention shrinks with interval and slides forward daily — roughly 8 trading days at 1-minute, 40 at 5-minute (default), 110 at 15-minute, a year at 30-minute, two years at 60-minute. A result's `earliest_bar_date_available`/`latest_bar_date_available` state the live bound for that call; a `date` older than `earliest_bar_date_available` needs a coarser `interval` or `ashares_daily_history` (daily only, no intraday).
@@ -83,7 +84,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1856+ data sources. The
+Both URLs reach the same gateway and the same 1863+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
